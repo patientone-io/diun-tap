@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.env
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE & Editors
+.idea/
+.vscode/
+*.swp
+
+# Application data & logs
+diun-data/
+*.log

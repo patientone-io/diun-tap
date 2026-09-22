@@ -1,0 +1,14 @@
+# ==============================================================================
+# DiunTap Custom Image Mappings (Optional)
+# ==============================================================================
+# DiunTap includes built-in mappings for dozens of popular homelab images
+# (Jellyfin, Navidrome, Vaultwarden, LiteLLM, Beszel, Uptime Kuma, etc.).
+#
+# Use this file to add or override mappings for private or custom images:
+# Syntax: "image_name_or_tag": "github_owner/github_repo"
+
+images:
+  # Example: Custom or non-standard image name to GitHub repo
+  # my-custom-app: "myorg/my-custom-app"
+  # ghcr.io/myteam/portal: "myteam/portal"
+  # local-registry.lan:5000/microservice: "company/microservice"

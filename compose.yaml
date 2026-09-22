@@ -1,0 +1,47 @@
+services:
+  diun-tap:
+    image: ghcr.io/patientone-io/diun-tap:latest
+    # build: . # Uncomment to build locally from source
+    container_name: diun-tap
+    restart: unless-stopped
+    labels:
+      - "diun.enable=false"
+    ports:
+      - "${WEBHOOK_PORT:-5000}:5000"
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount your host directory containing docker compose stacks (1:1 mount):
+      - ${DOCKER_STACKS_DIR:-/srv/docker}:${DOCKER_STACKS_DIR:-/srv/docker}
+      # Optional: Custom mappings file (YAML or JSON)
+      # - ./mappings.yaml:/config/mappings.yaml:ro
+      # Optional: SSH key for remote multi-node setups
+      # - ~/.ssh:/root/.ssh:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DOCKER_STACKS_DIR=${DOCKER_STACKS_DIR:-/srv/docker}
+
+  # ----------------------------------------------------------------------------
+  # Optional: Bundled DIUN (Docker Image Update Notifier)
+  # Uncomment this block if you don't already have DIUN running.
+  # ----------------------------------------------------------------------------
+  # diun:
+  #   image: crazymax/diun:latest
+  #   container_name: diun
+  #   command: serve
+  #   restart: unless-stopped
+  #   labels:
+  #     - "diun.enable=false"
+  #   volumes:
+  #     - "/var/run/docker.sock:/var/run/docker.sock"
+  #     - "./diun-data:/data"
+  #   environment:
+  #     - "TZ=UTC"
+  #     - "DIUN_WATCH_SCHEDULE=0 */6 * * *"
+  #     - "DIUN_PROVIDERS_DOCKER=true"
+  #     - "DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true"
+  #     - "DIUN_NOTIF_WEBHOOK_ENDPOINT=http://diun-tap:5000/webhook/diun"
+  #     - "DIUN_NOTIF_WEBHOOK_METHOD=POST"
+  #   depends_on:
+  #     - diun-tap
