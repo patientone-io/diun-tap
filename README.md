@@ -95,6 +95,7 @@
 * 📋 **Smart GitHub Changelogs with Expandable Quotes:** Formats GitHub Releases markdown into Telegram-native `<blockquote expandable>` blocks. Clean typography, bold headers, clickable PR links, and a collapsible quote so long changelogs never clutter your chat.
 * 🎯 **Dual Stack Discovery:** Automatically identifies the target Compose stack and working directory directly from Docker container labels (`com.docker.compose.project`), with static filesystem directory scan as a reliable fallback.
 * 🛡️ **Notification Deduplication:** Bounded `TTLCache` debounce window prevents duplicate alerts when DIUN triggers concurrent webhooks for the same tag — without leaking memory over time.
+* 📌 **Pin / Freeze:** `EXCLUDE_IMAGES` (wildcard patterns) and `PINNED_STACKS` (exact names) silently skip notifications for containers you want to keep on a specific version.
 * 🔒 **100% LAN & Zero-Trust Friendly (Long Polling):** Receives Telegram button clicks using built-in Long Polling. **Zero open ports, zero port-forwarding, and no reverse proxies or Cloudflare tunnels required.**
 * 🔑 **Optional Webhook Authentication:** Set `DIUN_WEBHOOK_SECRET` and DIUN signs each delivery with header `X-Diun-Secret` (or `?token=`). Wrong secret → `401`. Unset → legacy mode with a clear `WARNING` in logs (smooth migration).
 * 👥 **Group-Safe Telegram Auth:** Only `from_user.id` is verified against `TELEGRAM_ALLOWED_USER_IDS` (falls back to `TELEGRAM_CHAT_ID`). Safe to use the bot in groups — strangers tapping your buttons get `Unauthorized`.
@@ -289,6 +290,8 @@ All settings can be configured via environment variables or a `.env` file:
 | `DOCKER_TIMEOUT_SECONDS` | Timeout for `pull` / `up -d` | `180` |
 | `WEBHOOK_PORT` | Port for the incoming DIUN webhook server | `5000` |
 | `MAPPINGS_FILE` | Path to custom YAML or JSON mappings file | `""` *(Optional)* |
+| `EXCLUDE_IMAGES` | CSV fnmatch patterns for images that never notify (e.g. `vaultwarden/server,*:nightly`) | `""` *(Optional)* |
+| `PINNED_STACKS` | CSV local stack / remote service names to freeze (exact match, notifications skipped) | `""` *(Optional)* |
 | `REMOTE_SSH_HOST` | SSH host alias for optional remote node updates | `""` *(Optional)* |
 | `REMOTE_NODE_NAME` | Display name for the optional remote node | `Remote` |
 | `REMOTE_CONFIGS_DIR` | Path to remote Quadlet/container config files | `/remote-configs` |
@@ -385,6 +388,7 @@ Mount the file into your container or set `MAPPINGS_FILE=/config/mappings.yaml`.
 * 📋 **Inteligentny Changelog z Rozwijanym Blokiem:** Parsowanie opisów wydań z GitHuba do natywnych bloków `<blockquote expandable>` Telegrama. Estetyczna typografia, pogrubione nagłówki, klikalne linki do PR i zwijana treść, dzięki czemu długie changelogi nie zaśmiecają czatu.
 * 🎯 **Podwójna Detekcja Stosów:** Automatyczne odczytywanie nazwy projektu i ścieżki roboczej z etykiet działających kontenerów (`com.docker.compose.project`) z niezawodnym fallbackiem do skanowania katalogów na dysku.
 * 🛡️ **Deduplikacja Powiadomień:** Ograniczony pamięciowo `TTLCache` zapobiega wielokrotnym alertom o tym samym tagu — bez wycieku pamięci w długim czasie działania.
+* 📌 **Przypinanie / Zamrażanie:** `EXCLUDE_IMAGES` (wzorce z wildcardami) i `PINNED_STACKS` (dokładne nazwy) po cichu pomijają powiadomienia dla kontenerów, które mają zostać na danej wersji.
 * 🔒 **100% Lokalnie i Zero Trust (Long Polling):** Nasłuchiwanie przycisków przez wbudowaną pętlę Long Polling - brak konieczności wystawiania publicznych portów, domen czy tuneli Cloudflare.
 * 🔑 **Opcjonalna Autoryzacja Webhooka:** Ustaw `DIUN_WEBHOOK_SECRET`, a DIUN podpisze każde wywołanie nagłówkiem `X-Diun-Secret` (lub `?token=`). Zły sekret → `401`. Brak zmiennej → tryb legacy z wyraźnym `WARNING` w logach (płynna migracja).
 * 👥 **Bezpieczna Autoryzacja w Grupach:** Weryfikowane jest **wyłącznie** `from_user.id` klikającego względem `TELEGRAM_ALLOWED_USER_IDS` (fallback do `TELEGRAM_CHAT_ID`). Bota można bezpiecznie używać w grupach — obcy klikający dostaje `Brak uprawnień`.
@@ -579,6 +583,8 @@ Wszystkie ustawienia przez zmienne środowiskowe lub plik `.env`:
 | `DOCKER_TIMEOUT_SECONDS` | Timeout `pull` / `up -d` | `180` |
 | `WEBHOOK_PORT` | Port serwera webhooków DIUN | `5000` |
 | `MAPPINGS_FILE` | Ścieżka do własnego pliku mapowań YAML/JSON | `""` *(opcjonalnie)* |
+| `EXCLUDE_IMAGES` | Wzorce fnmatch obrazów CSV, które nigdy nie powiadamiają (np. `vaultwarden/server,*:nightly`) | `""` *(opcjonalnie)* |
+| `PINNED_STACKS` | Nazwy CSV lokalnych stosów / zdalnych usług do zamrożenia (dokładne dopasowanie, powiadomienia pomijane) | `""` *(opcjonalnie)* |
 | `REMOTE_SSH_HOST` | Alias SSH opcjonalnego zdalnego węzła | `""` *(opcjonalnie)* |
 | `REMOTE_NODE_NAME` | Nazwa wyświetlana zdalnego węzła | `Remote` |
 | `REMOTE_CONFIGS_DIR` | Katalog zdalnych plików Quadlet/kontenerów | `/remote-configs` |

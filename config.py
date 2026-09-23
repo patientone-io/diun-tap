@@ -9,6 +9,8 @@ Security-relevant behaviour:
   - DOCKER_GID documents the host docker socket group id. It is consumed by
     compose.yaml (group_add) and validated at startup so a non-root container
     gets a actionable error instead of a cryptic PermissionError.
+  - EXCLUDE_IMAGES / PINNED_STACKS silently skip notifications for frozen
+    images or stacks (pin/freeze). See filters.py.
 """
 
 from __future__ import annotations
@@ -52,6 +54,8 @@ class Settings:
     dedup_window_seconds: int = 30
     diun_webhook_secret: str = ""
     mappings_file: str = ""
+    exclude_images: list[str] = field(default_factory=list)
+    pinned_stacks: list[str] = field(default_factory=list)
     ssh_timeout_seconds: int = 30
     docker_timeout_seconds: int = 180
 
@@ -119,6 +123,8 @@ def load_settings() -> Settings:
         dedup_window_seconds=30,
         diun_webhook_secret=os.getenv("DIUN_WEBHOOK_SECRET", "").strip(),
         mappings_file=os.getenv("MAPPINGS_FILE", "").strip(),
+        exclude_images=_parse_id_list(os.getenv("EXCLUDE_IMAGES", "")),
+        pinned_stacks=_parse_id_list(os.getenv("PINNED_STACKS", "")),
         ssh_timeout_seconds=ssh_timeout,
         docker_timeout_seconds=docker_timeout,
     )

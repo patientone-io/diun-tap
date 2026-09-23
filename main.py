@@ -572,6 +572,17 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
     img_name, tag = parse_image_and_tag(payload.image)
     logger.info("Received DIUN webhook: image=%s, tag=%s, status=%s", img_name, tag, payload.status)
 
+    # Pin/freeze filters: frozen images never produce notifications (checked
+    # before dedup so they don't pollute the cache either).
+    from filters import match_excluded_image, match_pinned_target, normalize_patterns
+
+    excluded_hit = match_excluded_image(
+        payload.image, img_name, normalize_patterns(settings.exclude_images)
+    )
+    if excluded_hit:
+        logger.info("Notification skipped (EXCLUDE_IMAGES=%s) for %s", excluded_hit, payload.image)
+        return
+
     dedup_key = f"{payload.image}:{tag}:{payload.status}"
     if await dedup.check_and_mark(dedup_key):
         logger.info("Duplicate notification ignored for %s", dedup_key)
@@ -591,6 +602,13 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
     )
     local_stack = targets.get("local")
     remote_service = targets.get("remote")
+
+    pinned_hit = match_pinned_target(
+        local_stack, remote_service, normalize_patterns(settings.pinned_stacks)
+    )
+    if pinned_hit:
+        logger.info("Notification skipped (PINNED_STACKS, target=%s) for %s", pinned_hit, payload.image)
+        return
 
     title_key = "title_update" if payload.status == "update" else "title_new"
     msg_lines = [

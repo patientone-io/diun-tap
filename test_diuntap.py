@@ -17,6 +17,7 @@ os.environ["LANGUAGE"] = "en"
 os.environ["LOCAL_NODE_NAME"] = "TestNode"
 
 from dedup import DedupCache
+from filters import match_excluded_image, match_pinned_target, normalize_patterns
 from i18n import t
 from mappings import DEFAULT_IMAGE_TO_GITHUB, load_custom_mappings, resolve_github_repo
 from models import ActionStore, DiunWebhookPayload, parse_image_and_tag, parse_legacy_callback
@@ -289,6 +290,75 @@ class TestI18n(unittest.TestCase):
         self.assertEqual(set(STRINGS["en"].keys()), set(STRINGS["pl"].keys()))
         self.assertIn("toast_already_running", STRINGS["en"])
         self.assertIn("toast_already_running", STRINGS["pl"])
+
+
+class TestFilters(unittest.TestCase):
+    def test_normalize_drops_blanks(self):
+        self.assertEqual(
+            normalize_patterns(["  ", "Vaultwarden/Server ", "", "*/nightly"]),
+            ["vaultwarden/server", "*/nightly"],
+        )
+
+    def test_exclude_exact_and_short_name(self):
+        patterns = normalize_patterns(["vaultwarden/server"])
+        self.assertEqual(
+            match_excluded_image(
+                "docker.io/vaultwarden/server:latest", "vaultwarden/server", patterns
+            ),
+            "vaultwarden/server",
+        )
+        # short-name match: pattern without registry hits full refs too
+        patterns = normalize_patterns(["navidrome"])
+        self.assertEqual(
+            match_excluded_image(
+                "deluan/navidrome:v0.55.0", "deluan/navidrome", patterns
+            ),
+            "navidrome",
+        )
+
+    def test_exclude_wildcards(self):
+        patterns = normalize_patterns(["*:nightly", "ghcr.io/internal/*"])
+        self.assertEqual(
+            match_excluded_image("myorg/app:nightly", "myorg/app", patterns),
+            "*:nightly",
+        )
+        self.assertEqual(
+            match_excluded_image(
+                "ghcr.io/internal/portal:1.0", "ghcr.io/internal/portal", patterns
+            ),
+            "ghcr.io/internal/*",
+        )
+        self.assertIsNone(
+            match_excluded_image("myorg/app:stable", "myorg/app", patterns)
+        )
+
+    def test_exclude_case_insensitive(self):
+        patterns = normalize_patterns(["Vaultwarden/Server"])
+        self.assertEqual(
+            match_excluded_image(
+                "VAULTWARDEN/SERVER:LATEST", "vaultwarden/server", patterns
+            ),
+            "vaultwarden/server",
+        )
+
+    def test_exclude_no_patterns_never_matches(self):
+        self.assertIsNone(match_excluded_image("a/b:1", "a/b", []))
+
+    def test_pinned_exact_local_and_remote(self):
+        patterns = normalize_patterns(["postgres", "Vaultwarden"])
+        self.assertEqual(match_pinned_target("postgres", None, patterns), "postgres")
+        self.assertEqual(
+            match_pinned_target(None, "vaultwarden", patterns), "vaultwarden"
+        )
+        self.assertIsNone(match_pinned_target("navidrome", None, patterns))
+        self.assertIsNone(match_pinned_target(None, None, patterns))
+        self.assertIsNone(match_pinned_target("postgres", None, []))
+
+    def test_pinned_no_wildcards_partial_does_not_match(self):
+        # PINNED_STACKS is exact-match by design (no fnmatch): "post" must
+        # not freeze "postgres".
+        patterns = normalize_patterns(["post"])
+        self.assertIsNone(match_pinned_target("postgres", None, patterns))
 
 
 if __name__ == "__main__":
