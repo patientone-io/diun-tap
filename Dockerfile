@@ -1,8 +1,12 @@
 FROM python:3.12-slim
 
+# Host docker socket group id (default 999 = Debian docker group).
+# Override at build time: docker build --build-arg DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+ARG DOCKER_GID=999
+
 WORKDIR /app
 
-# Install Docker CLI, Docker Compose Plugin, and OpenSSH client
+# Install Docker CLI, Docker Compose plugin and OpenSSH client.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -16,18 +20,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 diuntap \
+    && (getent group "${DOCKER_GID}" || groupadd -g "${DOCKER_GID}" docker-host) \
     && useradd -u 1000 -g diuntap -d /home/diuntap -m -s /bin/bash diuntap \
-    && mkdir -p /srv/docker /config \
-    && chown -R 1000:1000 /app /srv/docker /config
+    && usermod -aG "${DOCKER_GID}" diuntap \
+    && mkdir -p /srv/docker /config /home/diuntap/.ssh \
+    && chown -R 1000:1000 /app /srv/docker /config /home/diuntap
 
 COPY --chown=1000:1000 requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=1000:1000 app.py mappings.py i18n.py formatters.py ./
+COPY --chown=1000:1000 main.py app.py config.py models.py security.py dedup.py \
+    github_client.py telegram_client.py polling.py docker_local.py remote_ssh.py \
+    errors.py mappings.py i18n.py formatters.py ./
 
 EXPOSE 5000
 
 ENV PYTHONUNBUFFERED=1 \
-    DOCKER_STACKS_DIR=/srv/docker
+    DOCKER_STACKS_DIR=/srv/docker \
+    HOME=/home/diuntap
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000"]
+USER diuntap
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]

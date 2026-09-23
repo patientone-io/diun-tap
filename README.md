@@ -49,14 +49,16 @@
 │  Scans registries (Docker Hub, GHCR, Quay, etc.)       │
 └──────────────────────────┬─────────────────────────────┘
                            │ Webhook POST /webhook/diun
+                           │ (optional X-Diun-Secret auth)
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │                        DiunTap                         │
 │                                                        │
-│  1. Fetches Release Notes from GitHub API              │
-│  2. Identifies Compose stack via labels or directory   │
-│  3. Formats Telegram HTML with <blockquote expandable> │
-│  4. Listens for button taps (LAN Long Polling)         │
+│  1. Verifies webhook secret (if configured)            │
+│  2. Fetches Release Notes from GitHub API              │
+│  3. Identifies Compose stack via labels or directory   │
+│  4. Formats Telegram HTML with <blockquote expandable> │
+│  5. Listens for button taps (LAN Long Polling)         │
 └──────────────────────────┬─────────────────────────────┘
                            │ Telegram Bot API
                            ▼
@@ -73,13 +75,17 @@
 ┌────────────────────────────────────────────────────────┐
 │                        DiunTap                         │
 │                                                        │
-│  1. Tags current image as restore point (:diun-backup) │
+│  1. Tags current images as restore points              │
+│     (:diun-backup-<service>-<timestamp>)   │
 │  2. Executes: docker compose pull && up -d             │
-│  3. Waits for healthcheck stabilization                │
+│  3. Polls health until stable (or timeout)             │
 │  4. If healthy: ✅ Success! [ ⏪ Rollback ]            │
-│  5. If failed:  ⚠️ Shows last 20 log lines + [Rollback]│
+│  5. If failed:  ⚠️ last 20 log lines + auto-rollback   │
+│     attempt + [ ⏪ Rollback ]                           │
 └────────────────────────────────────────────────────────┘
 ```
+
+**Code layout:** the application entrypoint is `main.py` (FastAPI app, webhook, Telegram polling, Docker/SSH orchestration). `app.py` is a backward-compatible shim (`from main import app`, so `uvicorn app:app` keeps working). Supporting modules: `config.py` (settings), `models.py` (payload validation + opaque button-action store), `security.py` (input allow-lists, auth), `docker_local.py` (Compose update/rollback/health), `remote_ssh.py` (validated SSH), `github_client.py`, `telegram_client.py`, `polling.py`, `dedup.py`, `errors.py`.
 
 ---
 
@@ -88,11 +94,14 @@
 * 🚀 **Human-in-the-Loop 1-Click Updates:** Decide exactly when to update your containers with a single tap from your phone or desktop.
 * 📋 **Smart GitHub Changelogs with Expandable Quotes:** Formats GitHub Releases markdown into Telegram-native `<blockquote expandable>` blocks. Clean typography, bold headers, clickable PR links, and a collapsible quote so long changelogs never clutter your chat.
 * 🎯 **Dual Stack Discovery:** Automatically identifies the target Compose stack and working directory directly from Docker container labels (`com.docker.compose.project`), with static filesystem directory scan as a reliable fallback.
-* 🛡️ **Notification Deduplication:** Built-in debounce window prevents duplicate alerts when DIUN triggers concurrent webhooks for the same tag.
+* 🛡️ **Notification Deduplication:** Bounded `TTLCache` debounce window prevents duplicate alerts when DIUN triggers concurrent webhooks for the same tag — without leaking memory over time.
 * 🔒 **100% LAN & Zero-Trust Friendly (Long Polling):** Receives Telegram button clicks using built-in Long Polling. **Zero open ports, zero port-forwarding, and no reverse proxies or Cloudflare tunnels required.**
-* 🩺 **Post-Update Healthcheck & Auto-Diagnostics:** Waits for container stabilization after deployment. If a container exits or reports `unhealthy`, DiunTap captures the last 20 lines of logs and sends them directly to Telegram.
-* ⏪ **1-Click Rollback:** Automatically tags the running image as a backup (`:diun-backup-...`) before pulling. If an update introduces a breaking bug, tap `[ ⏪ Rollback ]` to instantly restore the previous working image.
-* 🌐 **Multi-Node Ready (Optional):** Supports local Docker Compose stacks out-of-the-box, with built-in optional support for remote nodes via SSH (e.g. Podman Quadlets or remote VPS).
+* 🔑 **Optional Webhook Authentication:** Set `DIUN_WEBHOOK_SECRET` and DIUN signs each delivery with header `X-Diun-Secret` (or `?token=`). Wrong secret → `401`. Unset → legacy mode with a clear `WARNING` in logs (smooth migration).
+* 👥 **Group-Safe Telegram Auth:** Only `from_user.id` is verified against `TELEGRAM_ALLOWED_USER_IDS` (falls back to `TELEGRAM_CHAT_ID`). Safe to use the bot in groups — strangers tapping your buttons get `Unauthorized`.
+* 🩺 **Post-Update Healthcheck & Auto-Diagnostics:** Polls container state until stable (or timeout). If a container exits or reports `unhealthy`, DiunTap captures the last 20 lines of logs, sends them to Telegram and attempts an automatic rollback.
+* ⏪ **1-Click Rollback:** Before pulling, every running image is tagged as a timestamped backup (`:diun-backup-<service>-<timestamp>`, retention: newest 3 per repo, multi-service aware). Rollback restores with `up -d --no-pull`, so a broken `:latest` is never re-pulled by accident.
+* 🧩 **Modular Hardened Codebase:** Strict input allow-lists (no shell injection into SSH), enforced subprocess timeouts, non-blocking filesystem scans, serialized per-stack updates (double-tap safe).
+* 🌐 **Multi-Node Ready (Optional):** Supports local Docker Compose stacks out-of-the-box, with built-in optional support for remote nodes via SSH (e.g. Podman Quadlets or remote VPS). Remote commands run with `StrictHostKeyChecking=yes`.
 * 🌍 **Localization:** Built-in support for English (`LANGUAGE=en`) and Polish (`LANGUAGE=pl`).
 * 📁 **Extensible Image Mappings:** Includes built-in mappings for dozens of popular homelab services, with support for custom overrides via `mappings.yaml`.
 
@@ -100,7 +109,16 @@
 
 ### 🚀 Quickstart
 
-Deploy DiunTap using Docker Compose in seconds:
+Deploy DiunTap using Docker Compose in seconds. **The container runs as non-root (`USER diuntap`)** and needs the host docker-socket group — see step 0.
+
+#### 0. Docker socket group (required once per host)
+
+```bash
+stat -c %g /var/run/docker.sock   # e.g. 999 on Debian, 998 elsewhere
+echo "DOCKER_GID=999" >> .env     # use YOUR number
+```
+
+If the number is wrong the container logs a clear `Permission denied on /var/run/docker.sock` hint instead of talking to Docker.
 
 #### Option A: All-in-One Compose (DiunTap + DIUN together)
 
@@ -112,14 +130,23 @@ services:
     image: ghcr.io/patientone-io/diun-tap:latest
     container_name: diun-tap
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    group_add:
+      - ${DOCKER_GID:-999} # must match `stat -c %g /var/run/docker.sock`
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     environment:
       - TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
       - TELEGRAM_CHAT_ID=123456789
+      - TELEGRAM_ALLOWED_USER_IDS=123456789 # optional, recommended for groups
+      - DIUN_WEBHOOK_SECRET=your_secret_here # optional, recommended
       - GITHUB_TOKEN= # optional (increases rate limit from 60 to 5,000 req/h)
       - LANGUAGE=en
       - DOCKER_STACKS_DIR=/srv/docker # Directory where your stacks are stored
+      - DOCKER_GID=${DOCKER_GID:-999}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # 1:1 mount matching DOCKER_STACKS_DIR
@@ -139,6 +166,7 @@ services:
       - "DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true"
       - "DIUN_NOTIF_WEBHOOK_ENDPOINT=http://diun-tap:5000/webhook/diun"
       - "DIUN_NOTIF_WEBHOOK_METHOD=POST"
+      - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
     depends_on:
       - diun-tap
 ```
@@ -155,14 +183,23 @@ services:
     image: ghcr.io/patientone-io/diun-tap:latest
     container_name: diun-tap
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    group_add:
+      - ${DOCKER_GID:-999} # must match `stat -c %g /var/run/docker.sock`
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     environment:
       - TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
       - TELEGRAM_CHAT_ID=123456789
+      - TELEGRAM_ALLOWED_USER_IDS=123456789 # optional, recommended for groups
+      - DIUN_WEBHOOK_SECRET=your_secret_here # optional, recommended
       - GITHUB_TOKEN= # optional
       - LANGUAGE=en
       - DOCKER_STACKS_DIR=/srv/docker # Directory where your stacks are stored
+      - DOCKER_GID=${DOCKER_GID:-999}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # 1:1 mount matching DOCKER_STACKS_DIR
@@ -176,6 +213,7 @@ services:
 environment:
   - "DIUN_NOTIF_WEBHOOK_ENDPOINT=http://<diun-tap-host>:5000/webhook/diun"
   - "DIUN_NOTIF_WEBHOOK_METHOD=POST"
+  - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
 ```
 
 **Or in `diun.yml` (if using a configuration file):**
@@ -187,9 +225,12 @@ notif:
     method: "POST"
     headers:
       Content-Type: "application/json"
+      X-Diun-Secret: "your_secret_here"
 ```
 
 *(If DIUN and DiunTap share the same Docker network, you can simply use `http://diun-tap:5000/webhook/diun`.)*
+
+> **Migration note:** if `DIUN_WEBHOOK_SECRET` is empty, DiunTap logs a `WARNING` and accepts webhooks without auth (legacy mode), so existing installs keep working until you set the secret on both sides.
 
 #### 3. Launch
 
@@ -199,15 +240,32 @@ Start your stack:
 docker compose up -d
 ```
 
-Verify service health:
+Verify service health (minimal public surface; details live behind the gated `/ready` endpoint):
 
 ```bash
 curl http://localhost:5000/health
-# {"status":"ok","app":"DiunTap","version":"1.0.0",...}
+# {"status":"ok","app":"DiunTap","version":"1.0.0","telegram_configured":true,...}
 ```
 
-> **Tip:** You can obtain a bot token from [@BotFather](https://t.me/BotFather) and your chat ID from [@userinfobot](https://t.me/userinfobot).
+> **Tip:** You can obtain a bot token from [@BotFather](https://t.me/BotFather) and your chat ID from [@userinfobot](https://t.me/userinfobot). For group use, list every allowed tapper in `TELEGRAM_ALLOWED_USER_IDS`.
 
+---
+
+### 🔑 Securing the DIUN webhook
+
+1. Generate a long random secret and put it in DiunTap's `.env`:
+   ```bash
+   openssl rand -hex 24
+   # .env: DIUN_WEBHOOK_SECRET=your_secret_here
+   ```
+2. Configure DIUN to send it (header preferred, query fallback):
+   - Compose: `DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here`
+   - or append `?token=your_secret_here` to the endpoint URL.
+3. Restart both services. A wrong/missing secret is rejected with `401 Invalid webhook secret` and a warning in DiunTap logs.
+
+### 👥 Telegram in groups
+
+Set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of numeric user IDs (get yours from `@userinfobot`). DiunTap checks **only** the button tapper's `from_user.id` — the chat/group ID is never trusted for authorization. When the variable is empty, the single `TELEGRAM_CHAT_ID` is used as the allow-list (single-user mode).
 
 ---
 
@@ -218,12 +276,17 @@ All settings can be configured via environment variables or a `.env` file:
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token from `@BotFather` | *(Required)* |
-| `TELEGRAM_CHAT_ID` | Telegram chat ID authorized to receive notifications and click buttons | *(Required)* |
+| `TELEGRAM_CHAT_ID` | Telegram chat ID for notifications; doubles as single-user allow-list fallback | *(Required)* |
+| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated user IDs allowed to tap buttons (`from_user.id` only) | `""` (= fallback to `TELEGRAM_CHAT_ID`) |
+| `DIUN_WEBHOOK_SECRET` | Shared secret for `/webhook/diun` (`X-Diun-Secret` header or `?token=`); empty = legacy mode + WARNING | `""` *(Optional, recommended)* |
 | `GITHUB_TOKEN` | GitHub Personal Access Token (increases rate limit from 60 to 5,000 req/h) | `""` *(Optional)* |
 | `LANGUAGE` | Interface language (`en` or `pl`) | `en` |
 | `LOCAL_NODE_NAME` | Display name for the local Docker host | `Local` |
 | `DOCKER_STACKS_DIR` | Directory where Docker Compose stacks are stored (mounted 1:1) | `/srv/docker` |
-| `HEALTHCHECK_WAIT_SECONDS` | Seconds to wait before checking container health after deployment | `6` |
+| `DOCKER_GID` | Host group id of `/var/run/docker.sock` (`stat -c %g …`); wired to `group_add` | `999` |
+| `HEALTHCHECK_WAIT_SECONDS` | How long to poll container health after deployment | `6` |
+| `SSH_TIMEOUT_SECONDS` | Timeout for a single SSH call | `30` |
+| `DOCKER_TIMEOUT_SECONDS` | Timeout for `pull` / `up -d` | `180` |
 | `WEBHOOK_PORT` | Port for the incoming DIUN webhook server | `5000` |
 | `MAPPINGS_FILE` | Path to custom YAML or JSON mappings file | `""` *(Optional)* |
 | `REMOTE_SSH_HOST` | SSH host alias for optional remote node updates | `""` *(Optional)* |
@@ -268,16 +331,67 @@ Mount the file into your container or set `MAPPINGS_FILE=/config/mappings.yaml`.
 
 ---
 
+### 🏗️ Jak to działa
+
+```text
+┌────────────────────────────────────────────────────────┐
+│             DIUN (detektor nowych obrazów)             │
+│  Skanuje rejestry (Docker Hub, GHCR, Quay, itd.)       │
+└──────────────────────────┬─────────────────────────────┘
+                           │ Webhook POST /webhook/diun
+                           │ (opcjonalnie X-Diun-Secret)
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│                        DiunTap                         │
+│                                                        │
+│  1. Weryfikuje sekret webhooka (jeśli ustawiony)       │
+│  2. Pobiera Release Notes z GitHub API                 │
+│  3. Wykrywa stos Compose (etykiety lub katalog)        │
+│  4. Formatuje HTML z <blockquote expandable>           │
+│  5. Nasłuchuje kliknięć (Long Polling w LAN)           │
+└──────────────────────────┬─────────────────────────────┘
+                           │ Telegram Bot API
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│               Twój Telegram (telefon / PC)             │
+│                                                        │
+│  🚀 Aktualizacja: navidrome                            │
+│  📋 Changelog: v0.55.0 (zwijany cytat)                 │
+│  [ 🚀 Uaktualnij teraz ]  [ ❌ Pomiń ]                 │
+│  [ 🌐 Otwórz Wydanie na GitHubie ]                     │
+└──────────────────────────┬─────────────────────────────┘
+                           │ Klik: [ 🚀 Uaktualnij teraz ]
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│                        DiunTap                         │
+│                                                        │
+│  1. Taguje obrazy jako punkty przywracania             │
+│     (:diun-backup-<service>-<timestamp>)   │
+│  2. Wykonuje: docker compose pull && up -d             │
+│  3. Czeka na stabilizację (polling healthchecka)       │
+│  4. Sukces: ✅ Gotowe! [ ⏪ Cofnij ]                    │
+│  5. Błąd: ⚠️ 20 linijek logów + próba auto-rollbacku   │
+│     + [ ⏪ Cofnij ]                                     │
+└────────────────────────────────────────────────────────┘
+```
+
+**Układ kodu:** punktem wejścia jest `main.py` (aplikacja FastAPI, webhook, polling Telegrama, orkiestracja Dockera/SSH). `app.py` to cienki shim wstecznej kompatybilności (`from main import app`, więc `uvicorn app:app` działa dalej). Moduły pomocnicze: `config.py` (ustawienia), `models.py` (walidacja payloadu + nieprzezroczysty rejestr akcji przycisków), `security.py` (allow-listy, autoryzacja), `docker_local.py` (update/rollback/health), `remote_ssh.py` (bezpieczny SSH), `github_client.py`, `telegram_client.py`, `polling.py`, `dedup.py`, `errors.py`.
+
+---
+
 ### ✨ Główne Funkcje
 
 * 🚀 **Interaktywne Aktualizacje 1-Click (Human-in-the-Loop):** Decydujesz, kiedy zrestartować usługę bezpośrednio z poziomu komunikatora w telefonie.
 * 📋 **Inteligentny Changelog z Rozwijanym Blokiem:** Parsowanie opisów wydań z GitHuba do natywnych bloków `<blockquote expandable>` Telegrama. Estetyczna typografia, pogrubione nagłówki, klikalne linki do PR i zwijana treść, dzięki czemu długie changelogi nie zaśmiecają czatu.
 * 🎯 **Podwójna Detekcja Stosów:** Automatyczne odczytywanie nazwy projektu i ścieżki roboczej z etykiet działających kontenerów (`com.docker.compose.project`) z niezawodnym fallbackiem do skanowania katalogów na dysku.
-* 🛡️ **Deduplikacja Powiadomień:** Wbudowane okno debounce zapobiega wielokrotnym alertom o tym samym tagu w krótkim odstępie czasu.
+* 🛡️ **Deduplikacja Powiadomień:** Ograniczony pamięciowo `TTLCache` zapobiega wielokrotnym alertom o tym samym tagu — bez wycieku pamięci w długim czasie działania.
 * 🔒 **100% Lokalnie i Zero Trust (Long Polling):** Nasłuchiwanie przycisków przez wbudowaną pętlę Long Polling - brak konieczności wystawiania publicznych portów, domen czy tuneli Cloudflare.
-* 🩺 **Automatyczny Healthcheck i Diagnostyka:** Sprawdzenie stanu kontenerów po restarcie. Jeśli usługa zgłosi błąd, bot przechwytuje ostatnie 20 linijek logów i przesyła je na czacie.
-* ⏪ **1-Click Rollback:** Oznaczanie poprzedniego obrazu tagiem przywracania (`:diun-backup-...`) przed aktualizacją. W razie problemu jedno kliknięcie przywraca poprzedni stan.
-* 🌐 **Wsparcie Multi-Node (Opcjonalnie):** Domyślnie lokalny Docker Compose, z opcją obsługi zdalnych węzłów po SSH (np. Podman Quadlets czy zdalny serwer VPS).
+* 🔑 **Opcjonalna Autoryzacja Webhooka:** Ustaw `DIUN_WEBHOOK_SECRET`, a DIUN podpisze każde wywołanie nagłówkiem `X-Diun-Secret` (lub `?token=`). Zły sekret → `401`. Brak zmiennej → tryb legacy z wyraźnym `WARNING` w logach (płynna migracja).
+* 👥 **Bezpieczna Autoryzacja w Grupach:** Weryfikowane jest **wyłącznie** `from_user.id` klikającego względem `TELEGRAM_ALLOWED_USER_IDS` (fallback do `TELEGRAM_CHAT_ID`). Bota można bezpiecznie używać w grupach — obcy klikający dostaje `Brak uprawnień`.
+* 🩺 **Automatyczny Healthcheck i Diagnostyka:** Stan kontenerów jest odpytywany aż do stabilizacji (lub timeoutu). Jeśli usługa zgłosi błąd, bot przechwytuje ostatnie 20 linijek logów, wysyła je na czat i próbuje automatycznego rollbacku.
+* ⏪ **1-Click Rollback:** Przed pobraniem każdy działający obraz dostaje timestampowany tag backupu (`:diun-backup-<service>-<timestamp>`, retencja: 3 najnowsze na repo, obsługa stosów multi-service). Rollback stawia kontenery przez `up -d --no-pull`, więc uszkodzony `:latest` nigdy nie zostanie przypadkowo dociągnięty.
+* 🧩 **Modularna, Utwardzona Baza Kodu:** Surowe allow-listy danych wejściowych (brak wstrzyknięć do shella po SSH), wymuszone timeouty podprocesów, nieblokujące skanowanie plików, serializacja aktualizacji na stos (bezpieczny podwójny klik).
+* 🌐 **Wsparcie Multi-Node (Opcjonalnie):** Domyślnie lokalny Docker Compose, z opcją obsługi zdalnych węzłów po SSH (np. Podman Quadlets czy zdalny serwer VPS). Komendy zdalne działają z `StrictHostKeyChecking=yes`.
 * 🌍 **Wielojęzyczność:** Pełne wsparcie dla języka polskiego (`LANGUAGE=pl`) oraz angielskiego (`LANGUAGE=en`).
 * 📁 **Rozszerzalne Mapowania Obrazów:** Baza popularnych serwisów z możliwością dodania własnych definicji przez `mappings.yaml`.
 
@@ -285,7 +399,16 @@ Mount the file into your container or set `MAPPINGS_FILE=/config/mappings.yaml`.
 
 ### 🚀 Szybki Start
 
-Uruchom DiunTap za pomocą Docker Compose w kilka sekund:
+Uruchom DiunTap za pomocą Docker Compose w kilka sekund. **Kontener działa jako non-root (`USER diuntap`)** i potrzebuje grupy gniazda Dockera z hosta — patrz krok 0.
+
+#### 0. Grupa gniazda Dockera (raz na host)
+
+```bash
+stat -c %g /var/run/docker.sock   # np. 999 na Debianie, 998 gdzie indziej
+echo "DOCKER_GID=999" >> .env     # wpisz SWÓJ numer
+```
+
+Zły numer = czytelny błąd `Permission denied on /var/run/docker.sock` w logach zamiast dostępu do Dockera.
 
 #### Opcja A: Wszystko w jednym (DiunTap + DIUN w jednym compose.yaml)
 
@@ -297,14 +420,23 @@ services:
     image: ghcr.io/patientone-io/diun-tap:latest
     container_name: diun-tap
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    group_add:
+      - ${DOCKER_GID:-999} # musi zgadzać się z `stat -c %g /var/run/docker.sock`
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     environment:
       - TELEGRAM_BOT_TOKEN=twoj_token_z_botfather
       - TELEGRAM_CHAT_ID=twoj_chat_id
+      - TELEGRAM_ALLOWED_USER_IDS=twoj_chat_id # opcjonalnie, zalecane przy grupach
+      - DIUN_WEBHOOK_SECRET=your_secret_here # opcjonalnie, zalecane
       - GITHUB_TOKEN= # opcjonalnie (zwiększa limit zapytań API z 60 do 5000/h)
       - LANGUAGE=pl
       - DOCKER_STACKS_DIR=/srv/docker # Katalog ze stosami Docker Compose
+      - DOCKER_GID=${DOCKER_GID:-999}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # Montowanie 1:1 zgodne z DOCKER_STACKS_DIR
@@ -324,6 +456,7 @@ services:
       - "DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true"
       - "DIUN_NOTIF_WEBHOOK_ENDPOINT=http://diun-tap:5000/webhook/diun"
       - "DIUN_NOTIF_WEBHOOK_METHOD=POST"
+      - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
     depends_on:
       - diun-tap
 ```
@@ -340,14 +473,23 @@ services:
     image: ghcr.io/patientone-io/diun-tap:latest
     container_name: diun-tap
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    group_add:
+      - ${DOCKER_GID:-999} # musi zgadzać się z `stat -c %g /var/run/docker.sock`
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     environment:
       - TELEGRAM_BOT_TOKEN=twoj_token_z_botfather
       - TELEGRAM_CHAT_ID=twoj_chat_id
+      - TELEGRAM_ALLOWED_USER_IDS=twoj_chat_id # opcjonalnie, zalecane przy grupach
+      - DIUN_WEBHOOK_SECRET=your_secret_here # opcjonalnie, zalecane
       - GITHUB_TOKEN= # opcjonalnie
       - LANGUAGE=pl
       - DOCKER_STACKS_DIR=/srv/docker # Katalog ze stosami Docker Compose
+      - DOCKER_GID=${DOCKER_GID:-999}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # Montowanie 1:1 zgodne z DOCKER_STACKS_DIR
@@ -361,6 +503,7 @@ services:
 environment:
   - "DIUN_NOTIF_WEBHOOK_ENDPOINT=http://<adres-hosta-diun-tap>:5000/webhook/diun"
   - "DIUN_NOTIF_WEBHOOK_METHOD=POST"
+  - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
 ```
 
 **Lub w pliku konfiguracyjnym `diun.yml` (jeśli z niego korzystasz):**
@@ -372,9 +515,12 @@ notif:
     method: "POST"
     headers:
       Content-Type: "application/json"
+      X-Diun-Secret: "your_secret_here"
 ```
 
 *(Jeśli DIUN i DiunTap pracują w tej samej sieci Dockera, wystarczy podać adres wewnętrzny: `http://diun-tap:5000/webhook/diun`.)*
+
+> **Migracja:** gdy `DIUN_WEBHOOK_SECRET` jest puste, DiunTap loguje `WARNING` i przyjmuje webhooki bez autoryzacji (tryb legacy), więc istniejące instalacje działają do czasu ustawienia sekretu po obu stronach.
 
 #### 3. Uruchomienie
 
@@ -384,23 +530,86 @@ Uruchom kontener:
 docker compose up -d
 ```
 
-Sprawdź stan usługi:
+Sprawdź stan usługi (minimalna publiczna odpowiedź; szczegóły w bramkowanym endpoincie `/ready`):
 
 ```bash
 curl http://localhost:5000/health
-# {"status":"ok","app":"DiunTap","version":"1.0.0",...}
+# {"status":"ok","app":"DiunTap","version":"1.0.0","telegram_configured":true,...}
 ```
 
-> **Wskazówka:** Token bota uzyskasz z [@BotFather](https://t.me/BotFather), a swój identyfikator z [@userinfobot](https://t.me/userinfobot).
+> **Wskazówka:** Token bota uzyskasz z [@BotFather](https://t.me/BotFather), a swój identyfikator z [@userinfobot](https://t.me/userinfobot). Do użycia w grupach wpisz wszystkich uprawnionych w `TELEGRAM_ALLOWED_USER_IDS`.
 
+---
+
+### 🔑 Zabezpieczenie webhooka DIUN
+
+1. Wygeneruj długi losowy sekret i wpisz go do `.env` DiunTap:
+   ```bash
+   openssl rand -hex 24
+   # .env: DIUN_WEBHOOK_SECRET=your_secret_here
+   ```
+2. Skonfiguruj DIUN, by go wysyłał (nagłówek zalecany, query jako fallback):
+   - Compose: `DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here`
+   - albo dopisz `?token=your_secret_here` do URL endpointu.
+3. Zrestartuj obie usługi. Zły/brakujący sekret to `401 Invalid webhook secret` plus ostrzeżenie w logach DiunTap.
+
+### 👥 Telegram w grupach
+
+Ustaw `TELEGRAM_ALLOWED_USER_IDS` jako listę numerycznych ID użytkowników oddzielonych przecinkami (swój poznasz przez `@userinfobot`). DiunTap sprawdza **wyłącznie** `from_user.id` klikającego — ID czatu/grupy nigdy nie jest podstawą autoryzacji. Gdy zmienna jest pusta, allow-listą jest pojedynczy `TELEGRAM_CHAT_ID` (tryb jednoosobowy).
+
+---
+
+### ⚙️ Tabela konfiguracji
+
+Wszystkie ustawienia przez zmienne środowiskowe lub plik `.env`:
+
+| Zmienna | Opis | Domyślnie |
+| :--- | :--- | :--- |
+| `TELEGRAM_BOT_TOKEN` | Token bota z `@BotFather` | *(Wymagany)* |
+| `TELEGRAM_CHAT_ID` | ID czatu do powiadomień; fallback allow-listy jednoosobowej | *(Wymagany)* |
+| `TELEGRAM_ALLOWED_USER_IDS` | ID użytkowników mogących klikać (tylko `from_user.id`) | `""` (= fallback do `TELEGRAM_CHAT_ID`) |
+| `DIUN_WEBHOOK_SECRET` | Współdzielony sekret `/webhook/diun` (nagłówek `X-Diun-Secret` lub `?token=`); pusty = tryb legacy + WARNING | `""` *(opcjonalny, zalecany)* |
+| `GITHUB_TOKEN` | Token GitHub (limit API z 60 do 5000 req/h) | `""` *(opcjonalny)* |
+| `LANGUAGE` | Język interfejsu (`en` lub `pl`) | `en` |
+| `LOCAL_NODE_NAME` | Nazwa wyświetlana lokalnego hosta Docker | `Local` |
+| `DOCKER_STACKS_DIR` | Katalog ze stosami Compose (montowany 1:1) | `/srv/docker` |
+| `DOCKER_GID` | GID gniazda `/var/run/docker.sock` z hosta (`stat -c %g …`); podpinany przez `group_add` | `999` |
+| `HEALTHCHECK_WAIT_SECONDS` | Jak długo odpytywać health kontenerów po wdrożeniu | `6` |
+| `SSH_TIMEOUT_SECONDS` | Timeout pojedynczego wywołania SSH | `30` |
+| `DOCKER_TIMEOUT_SECONDS` | Timeout `pull` / `up -d` | `180` |
+| `WEBHOOK_PORT` | Port serwera webhooków DIUN | `5000` |
+| `MAPPINGS_FILE` | Ścieżka do własnego pliku mapowań YAML/JSON | `""` *(opcjonalnie)* |
+| `REMOTE_SSH_HOST` | Alias SSH opcjonalnego zdalnego węzła | `""` *(opcjonalnie)* |
+| `REMOTE_NODE_NAME` | Nazwa wyświetlana zdalnego węzła | `Remote` |
+| `REMOTE_CONFIGS_DIR` | Katalog zdalnych plików Quadlet/kontenerów | `/remote-configs` |
+
+---
+
+### 🗺️ Własne Mapowania Obrazów
+
+DiunTap ma wbudowane mapowania dla dziesiątek popularnych obrazów (np. `linuxserver/jellyfin` -> `jellyfin/jellyfin`, `vaultwarden/server` -> `dani-garcia/vaultwarden`).
+
+Dla własnych lub prywatnych obrazów utwórz plik `mappings.yaml`:
+
+```yaml
+images:
+  my-app: "organization/my-app-repo"
+  ghcr.io/internal/dashboard: "internal/dashboard"
+```
+
+Zamontuj go w kontenerze lub ustaw `MAPPINGS_FILE=/config/mappings.yaml`.
 
 ---
 
 ## 🔒 Security & Privacy / Bezpieczeństwo i prywatność
 
+* **Non-root by default:** the container runs as `USER diuntap` (uid 1000) with `cap_drop: ALL`. Docker socket access is granted via the host-matching group (`group_add: ${DOCKER_GID}`) instead of running as root.
 * **Zero Public Attack Surface:** Telegram communication uses Long Polling (`getUpdates`). You do not need to open any firewall ports or expose webhooks to the internet.
-* **Access Control:** DiunTap verifies the sender `user_id` and `chat_id` on every button callback. Actions triggered by unauthorized users are rejected immediately.
-* **Local-First & Zero Telemetry:** No analytics, no tracking, and no external proxies. All communication happens strictly between DIUN, your local Docker daemon, GitHub API, and Telegram.
+* **Access Control:** DiunTap verifies **only** the button tapper's `from_user.id` against `TELEGRAM_ALLOWED_USER_IDS` (falling back to `TELEGRAM_CHAT_ID`). Actions triggered by unauthorized users are rejected immediately. The DIUN webhook itself is optionally signed with `DIUN_WEBHOOK_SECRET` (`401` on mismatch).
+* **Hardened execution:** strict input allow-lists, `shlex`-quoted SSH atoms, enforced timeouts on every subprocess/SSH call, symlink-aware stack resolution, serialized per-stack updates.
+* **Local-First & Zero Telemetry:** No analytics, no tracking, and no external proxies. All communication happens strictly between DIUN, your local Docker daemon, GitHub API, and Telegram. Bot tokens never appear in logs; `/health` exposes no hostnames or paths (details live behind the gated `/ready` endpoint).
+
+---
 
 ## 🛠️ Building from Source / Budowanie ze źródeł
 
@@ -410,8 +619,12 @@ For contributors or developers who prefer to build the Docker image locally from
 ```bash
 git clone https://github.com/patientone-io/diun-tap.git
 cd diun-tap
-docker compose build
+docker build --build-arg DOCKER_GID=$(stat -c %g /var/run/docker.sock) -t diun-tap .
+docker compose up -d
 ```
+
+> The `--build-arg DOCKER_GID=...` bakes the host docker-socket group into the image so the non-root `diuntap` user keeps socket access. It must match the `DOCKER_GID` / `group_add` value used at runtime.  
+> *Parametr `--build-arg DOCKER_GID=...` wbudowuje grupę gniazda Dockera z hosta w obraz, dzięki czemu non-root `diuntap` zachowuje dostęp do socketa. Musi zgadzać się z wartością `DOCKER_GID` / `group_add` użytą w runtime.*
 
 ---
 

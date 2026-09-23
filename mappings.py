@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -147,3 +148,42 @@ def resolve_github_repo(image_name: str, mappings: Dict[str, str]) -> Optional[s
         return clean
 
     return None
+
+
+def load_remote_quadlets_fallback(configs_dir: Path) -> Dict[str, str]:
+    """Read image -> service mappings from remote *.container quadlet files.
+
+    Synchronous by design: callers run it via asyncio.to_thread().
+    Symlinks are skipped to avoid directory escapes.
+    """
+    services: Dict[str, str] = {}
+    try:
+        if not configs_dir.exists():
+            return services
+        try:
+            from models import parse_image_and_tag
+        except Exception:  # pragma: no cover - fallback parser
+            parse_image_and_tag = None  # type: ignore
+
+        for cfile in configs_dir.glob("*.container"):
+            try:
+                if cfile.is_symlink():
+                    continue
+                service_name = cfile.stem
+                text = cfile.read_text(encoding="utf-8", errors="ignore")
+                img_match = re.search(r"^Image=(.+)$", text, re.MULTILINE)
+                if img_match:
+                    raw_img = img_match.group(1).strip()
+                    if parse_image_and_tag is not None:
+                        clean_img, _ = parse_image_and_tag(raw_img)
+                    else:
+                        clean_img = raw_img.split("@")[0].split(":")[0]
+                    services[clean_img] = service_name
+                    short = clean_img.split("/")[-1]
+                    if short not in services:
+                        services[short] = service_name
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"Error reading remote configs dir ({configs_dir}): {e}")
+    return services

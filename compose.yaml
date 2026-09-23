@@ -1,9 +1,21 @@
 services:
   diun-tap:
     image: ghcr.io/patientone-io/diun-tap:latest
-    # build: . # Uncomment to build locally from source
+    # build:
+    #   context: .
+    #   args:
+    #     # Match the host docker socket group so the non-root user keeps access:
+    #     # stat -c %g /var/run/docker.sock
+    #     DOCKER_GID: ${DOCKER_GID:-999}
     container_name: diun-tap
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    # Grant the container group matching the host docker.sock gid.
+    # Find it with: stat -c %g /var/run/docker.sock (often 999 on Debian, 998 elsewhere)
+    # and export DOCKER_GID before `docker compose up`.
+    group_add:
+      - ${DOCKER_GID:-999}
     labels:
       - "diun.enable=false"
     ports:
@@ -16,11 +28,15 @@ services:
       - ${DOCKER_STACKS_DIR:-/srv/docker}:${DOCKER_STACKS_DIR:-/srv/docker}
       # Optional: Custom mappings file (YAML or JSON)
       # - ./mappings.yaml:/config/mappings.yaml:ro
-      # Optional: SSH key for remote multi-node setups
-      # - ~/.ssh:/root/.ssh:ro
+      # Optional: SSH key + known_hosts for remote multi-node setups.
+      # IMPORTANT: keep StrictHostKeyChecking=yes (default in remote_ssh.py),
+      # so mount a real known_hosts file instead of /dev/null.
+      # - ~/.ssh/id_ed25519:/home/diuntap/.ssh/id_ed25519:ro
+      # - ~/.ssh/known_hosts:/home/diuntap/.ssh/known_hosts:ro
     environment:
       - PYTHONUNBUFFERED=1
       - DOCKER_STACKS_DIR=${DOCKER_STACKS_DIR:-/srv/docker}
+      - DOCKER_GID=${DOCKER_GID:-999}
 
   # ----------------------------------------------------------------------------
   # Optional: Bundled DIUN (Docker Image Update Notifier)
@@ -43,5 +59,7 @@ services:
   #     - "DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT=true"
   #     - "DIUN_NOTIF_WEBHOOK_ENDPOINT=http://diun-tap:5000/webhook/diun"
   #     - "DIUN_NOTIF_WEBHOOK_METHOD=POST"
+  #     # When DIUN_WEBHOOK_SECRET is set for DiunTap, also set:
+  #     # - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
   #   depends_on:
   #     - diun-tap

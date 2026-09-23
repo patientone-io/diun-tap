@@ -35,6 +35,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "toast_rollback": "Starting rollback on {node}: {name}...",
         "toast_dismissed": "Dismissed.",
         "toast_no_permission": "Unauthorized.",
+        "toast_already_running": "Already running…",
         "no_containers_running": "⚠️ <i>No running containers found in stack.</i>",
         "truncated_changelog": "\n\n<i>…(truncated, click link for full notes)</i>",
     },
@@ -69,6 +70,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "toast_rollback": "Rozpoczynam rollback na {node}: {name}...",
         "toast_dismissed": "Zamknięto.",
         "toast_no_permission": "Brak uprawnień.",
+        "toast_already_running": "Już w trakcie…",
         "no_containers_running": "⚠️ <i>Brak działających kontenerów w stosie.</i>",
         "truncated_changelog": "\n\n<i>…(skrócono, kliknij link po całość)</i>",
     }
