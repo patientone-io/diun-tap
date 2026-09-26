@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=1000:1000 main.py app.py config.py models.py security.py dedup.py \
     github_client.py telegram_client.py polling.py docker_local.py remote_ssh.py \
-    errors.py mappings.py i18n.py formatters.py ./
+    errors.py mappings.py i18n.py formatters.py filters.py ./
 
 EXPOSE 5000
 
