@@ -52,7 +52,7 @@ async def get_github_release_notes(repo: str, tag: str, github_token: str) -> Op
 
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "DiunTap/1.0.0",
+        "User-Agent": "DiunTap/1.1.0",
     }
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"

@@ -29,7 +29,7 @@ from telegram_client import answer_callback_query, edit_telegram_message
 
 logger = logging.getLogger("diuntap")
 
-UpdateFn = Callable[[str | int, int, str, str, str], Coroutine[Any, Any, None]]
+UpdateFn = Callable[..., Coroutine[Any, Any, None]]
 
 _running: Dict[Tuple[str, str], asyncio.Task] = {}
 _running_lock = asyncio.Lock()
@@ -39,11 +39,14 @@ async def _run_serialized(key: Tuple[str, str], coro: Coroutine[Any, Any, None])
     async with _running_lock:
         existing = _running.get(key)
         if existing and not existing.done():
+            coro.close()
             return False
         task = asyncio.create_task(coro)
         _running[key] = task
 
         def _done(t: asyncio.Task) -> None:
+            if _running.get(key) is t:
+                _running.pop(key, None)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -56,15 +59,15 @@ async def _run_serialized(key: Tuple[str, str], coro: Coroutine[Any, Any, None])
 
 async def _resolve_callback(
     cb_data: str,
-) -> Optional[Tuple[str, str, str, str, str]]:
-    """Return (kind, node, target, tag, header). Header is empty for legacy."""
+) -> Optional[Tuple[str, str, str, str, str, str]]:
+    """Return (kind, node, target, tag, header, image). Legacy has no stored image."""
     if ":" in cb_data:
         prefix, _, rest = cb_data.partition(":")
         if prefix in ("upd", "rb", "ccl") and ":" not in rest:
             action = action_store.resolve(rest)
             if action is None:
                 return None
-            return (action.kind, action.node, action.target, action.tag, action.header)
+            return (action.kind, action.node, action.target, action.tag, action.header, action.image)
     legacy = parse_legacy_callback(cb_data)
     if legacy is None:
         return None
@@ -80,7 +83,7 @@ async def _resolve_callback(
         tag = sanitize_tag(tag)
     except Exception:
         return None
-    return (kind, node, target, tag, "")
+    return (kind, node, target, tag, "", "")
 
 
 async def telegram_polling_loop(
@@ -147,7 +150,7 @@ async def telegram_polling_loop(
                     if resolved is None:
                         await answer_callback_query(bot_token, cb_id, text=t_fn("toast_dismissed"))
                         continue
-                    kind, node, target, tag, stored_header = resolved
+                    kind, node, target, tag, stored_header, image = resolved
                     header_src = stored_header or (orig_text.split("\n\n")[0] if orig_text else "Container Update")
                     header = html.escape(header_src[:500])
 
@@ -159,7 +162,7 @@ async def telegram_polling_loop(
                             )
                             ok = await _run_serialized(
                                 ("rem", target),
-                                execute_remote_update(chat_id, msg_id, target, tag, header),
+                                execute_remote_update(chat_id, msg_id, target, tag, header, image),
                             )
                             if not ok:
                                 await answer_callback_query(bot_token, cb_id, text=t_fn("toast_already_running"))
@@ -170,7 +173,7 @@ async def telegram_polling_loop(
                             )
                             ok = await _run_serialized(
                                 ("loc", target),
-                                execute_local_update(chat_id, msg_id, target, tag, header),
+                                execute_local_update(chat_id, msg_id, target, tag, header, image),
                             )
                             if not ok:
                                 await answer_callback_query(bot_token, cb_id, text=t_fn("toast_already_running"))

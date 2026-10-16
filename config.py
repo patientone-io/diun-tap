@@ -49,7 +49,7 @@ class Settings:
     remote_ssh_host: str = ""
     remote_node_name: str = "Remote"
     remote_configs_dir: Path = field(default_factory=lambda: Path("/remote-configs"))
-    healthcheck_wait_seconds: int = 6
+    healthcheck_wait_seconds: int = 60
     webhook_port: int = 5000
     dedup_window_seconds: int = 30
     diun_webhook_secret: str = ""
@@ -84,9 +84,9 @@ def load_settings() -> Settings:
         allowed = [chat_id]
 
     try:
-        health_wait = int(os.getenv("HEALTHCHECK_WAIT_SECONDS", "6"))
+        health_wait = int(os.getenv("HEALTHCHECK_WAIT_SECONDS", "60"))
     except ValueError:
-        health_wait = 6
+        health_wait = 60
     health_wait = max(2, min(health_wait, 300))
 
     try:

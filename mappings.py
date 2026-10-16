@@ -157,9 +157,10 @@ def load_remote_quadlets_fallback(configs_dir: Path) -> Dict[str, str]:
     Symlinks are skipped to avoid directory escapes.
     """
     services: Dict[str, str] = {}
+    ambiguous: set[str] = set()
     try:
         if not configs_dir.exists():
-            return services
+            return {}
         try:
             from models import parse_image_and_tag
         except Exception:  # pragma: no cover - fallback parser
@@ -178,12 +179,11 @@ def load_remote_quadlets_fallback(configs_dir: Path) -> Dict[str, str]:
                         clean_img, _ = parse_image_and_tag(raw_img)
                     else:
                         clean_img = raw_img.split("@")[0].split(":")[0]
+                    if clean_img in services and services[clean_img] != service_name:
+                        ambiguous.add(clean_img)
                     services[clean_img] = service_name
-                    short = clean_img.split("/")[-1]
-                    if short not in services:
-                        services[short] = service_name
             except Exception:
                 continue
     except Exception as e:
         logger.warning(f"Error reading remote configs dir ({configs_dir}): {e}")
-    return services
+    return {image: service for image, service in services.items() if image not in ambiguous}

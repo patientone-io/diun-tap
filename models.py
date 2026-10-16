@@ -4,16 +4,22 @@ Telegram `callback_data` is limited to 64 bytes, so the legacy format
 `upd:loc:<stack>:<tag>` forced dangerous truncation (`tag[:14]` broke tags
 like `v1.2.3-alpine`). This module provides an opaque action store instead:
 buttons carry `upd:<action_id>` / `rb:<action_id>` / `ccl:<action_id>` and the
-server resolves the full, validated parameters from memory. Legacy callbacks
-are still parsed (best effort) so messages sent before a restart keep working.
+server resolves the full parameters from SQLite. Actions persist across restarts
+when a database path is supplied. Legacy callbacks still use strict validation.
 """
 
 from __future__ import annotations
 
 import re
+import os
+import json
+import sqlite3
+import weakref
+import threading
+from pathlib import Path
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field, field_validator
@@ -62,7 +68,7 @@ def parse_image_and_tag(image_str: str) -> Tuple[str, str]:
     clean_img = image_str.strip()
     for prefix in ("docker.io/", "library/"):
         if clean_img.startswith(prefix):
-            clean_img = clean_img[len(prefix):]
+            clean_img = clean_img[len(prefix) :]
 
     if "@" in clean_img:
         clean_img = clean_img.split("@")[0]
@@ -71,12 +77,23 @@ def parse_image_and_tag(image_str: str) -> Tuple[str, str]:
     last_colon = clean_img.rfind(":")
 
     if last_colon > last_slash:
-        tag = clean_img[last_colon + 1:] or "latest"
+        tag = clean_img[last_colon + 1 :] or "latest"
         clean_img = clean_img[:last_colon]
     else:
         tag = "latest"
 
     return clean_img, tag
+
+
+def container_health(state: str, health: str) -> str:
+    """Classify a sample as healthy, failed, or pending (including unknown)."""
+    state, health = state.lower(), health.lower()
+    if state in ("exited", "dead", "restarting") or health == "unhealthy":
+        return "failed"
+    running = state == "running" or state.startswith("up ")
+    if running and health in ("", "none", "healthy"):
+        return "healthy"
+    return "pending"
 
 
 ActionKind = Literal["upd", "rb", "ccl"]
@@ -91,44 +108,95 @@ class PendingAction:
     tag: str  # full tag (never truncated)
     header: str  # plain-text header snapshot (already escaped at render time)
     created: float
+    image: str = ""
 
 
 class ActionStore:
-    """In-memory opaque action registry with TTL eviction."""
+    """Bounded action registry and restore points, optionally persisted in SQLite."""
 
-    def __init__(self, ttl_seconds: int = 7 * 24 * 3600, max_items: int = 4096) -> None:
+    def __init__(
+        self,
+        ttl_seconds: int = 7 * 24 * 3600,
+        max_items: int = 4096,
+        db_path: Optional[Path] = None,
+    ) -> None:
         self._ttl = ttl_seconds
         self._max = max_items
-        self._items: Dict[str, PendingAction] = {}
-
-    def register(self, kind: ActionKind, node: ActionNode, target: str, tag: str, header: str) -> str:
-        self.evict()
-        if len(self._items) >= self._max:
-            oldest = min(self._items, key=lambda k: self._items[k].created)
-            del self._items[oldest]
-        action_id = secrets.token_urlsafe(16)[:22]
-        self._items[action_id] = PendingAction(
-            kind=kind, node=node, target=target, tag=tag, header=header, created=time.time()
+        if db_path is not None:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(
+            str(db_path) if db_path else ":memory:", timeout=5.0, check_same_thread=False
         )
+        self._db.execute("PRAGMA busy_timeout=5000")
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, created REAL, payload TEXT)"
+        )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS restores (node TEXT, target TEXT, payload TEXT, PRIMARY KEY(node, target))"
+        )
+        self._db.commit()
+        self._finalizer = weakref.finalize(self, self._db.close)
+
+    def register(
+        self,
+        kind: ActionKind,
+        node: ActionNode,
+        target: str,
+        tag: str,
+        header: str,
+        image: str = "",
+    ) -> str:
+        self.evict()
+        action_id = secrets.token_urlsafe(16)
+        action = PendingAction(kind, node, target, tag, header, time.time(), image)
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO actions VALUES (?, ?, ?)",
+                (action_id, action.created, json.dumps(asdict(action))),
+            )
+            self._db.execute(
+                "DELETE FROM actions WHERE id IN (SELECT id FROM actions ORDER BY created DESC LIMIT -1 OFFSET ?)",
+                (self._max,),
+            )
         return action_id
 
     def resolve(self, action_id: str) -> Optional[PendingAction]:
-        action = self._items.get(action_id)
-        if action is None:
-            return None
-        if time.time() - action.created > self._ttl:
-            del self._items[action_id]
-            return None
-        return action
+        # Clicking a button is a read, not a cleanup transaction.
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payload FROM actions WHERE id = ? AND created >= ?",
+                (action_id, time.time() - self._ttl),
+            ).fetchone()
+        return PendingAction(**json.loads(row[0])) if row else None
 
     def evict(self) -> None:
-        now = time.time()
-        expired = [k for k, v in self._items.items() if now - v.created > self._ttl]
-        for k in expired:
-            del self._items[k]
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM actions WHERE created < ?", (time.time() - self._ttl,))
+
+    def save_restore_point(
+        self, node: str, target: str, backups: Dict[str, str], services: Optional[list[str]] = None
+    ) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO restores VALUES (?, ?, ?)",
+                (node, target, json.dumps({"backups": backups, "services": services or []})),
+            )
+
+    def restore_point(self, node: str, target: str) -> Optional[dict]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payload FROM restores WHERE node = ? AND target = ?", (node, target)
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def close(self) -> None:
+        with self._lock:
+            self._finalizer()
 
 
-action_store = ActionStore()
+action_store = ActionStore(db_path=Path(os.getenv("DIUNTAP_STATE_DIR", "data")) / "actions.sqlite3")
 
 
 def parse_legacy_callback(data: str) -> Optional[Tuple[str, str, str, str]]:

@@ -25,7 +25,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          python -m unittest test_diuntap.py
+          python -m unittest discover -v
 
   docker:
     needs: test

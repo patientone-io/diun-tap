@@ -4,28 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
-import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError as PydanticValidationError
 
 from config import IMAGE_MAPPINGS, settings
 from dedup import DedupCache
+from errors import ImageTagMismatch
 from docker_local import (
     _run,
     compose_logs,
     create_backups,
-    describe_containers,
     find_local_compose_file,
     find_targets_for_image,
     inspect_local_containers,
     wait_for_healthy,
+    update_services,
+    same_repository,
 )
 from formatters import format_markdown_for_telegram
 from github_client import get_github_release_notes
@@ -34,17 +35,17 @@ from mappings import load_remote_quadlets_fallback, resolve_github_repo
 from models import DiunWebhookPayload, action_store, parse_image_and_tag
 from polling import telegram_polling_loop
 from remote_ssh import (
-    remote_container_state,
     remote_inspect_image,
+    remote_inspect_image_id,
+    remote_wait_for_healthy,
+    remote_service_uses_image,
     remote_logs,
     remote_pull_image,
+    remote_prune_backups,
     remote_restart_service,
-    remote_service_active,
     remote_tag_image,
-    run_remote_ssh,
 )
 from security import (
-    is_telegram_user_allowed,
     sanitize_service_name,
     sanitize_stack_name,
     sanitize_tag,
@@ -52,6 +53,9 @@ from security import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# HTTP clients log request URLs containing the Telegram bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("diuntap")
 
 dedup = DedupCache(maxsize=512, ttl=settings.dedup_window_seconds)
@@ -62,9 +66,22 @@ is_polling_active = True
 # helpers
 # ---------------------------------------------------------------------------
 
+
 def _display_short(value: str, limit: int) -> str:
     value = value or ""
     return value if len(value) <= limit else value[:limit] + "…"
+
+
+def _rollback_message(result: bool | None) -> str:
+    if result is None:
+        return t("msg_auto_rollback_pending")
+    return t("msg_auto_rollback_ok" if result else "msg_auto_rollback_failed")
+
+
+def _manual_rollback_message(result: bool | None, stack: str) -> str:
+    if result is None:
+        return t("msg_auto_rollback_pending")
+    return t("msg_rollback_success" if result else "msg_rollback_warning", stack=stack)
 
 
 async def _load_remote_map() -> Dict[str, str]:
@@ -80,8 +97,14 @@ async def _load_remote_map() -> Dict[str, str]:
 # LOCAL update / rollback
 # ---------------------------------------------------------------------------
 
+
 async def execute_local_update(
-    chat_id: str | int, message_id: int, stack_name: str, tag: str, original_header: str
+    chat_id: str | int,
+    message_id: int,
+    stack_name: str,
+    tag: str,
+    original_header: str,
+    image: str = "",
 ) -> None:
     from telegram_client import edit_telegram_message
 
@@ -90,7 +113,9 @@ async def execute_local_update(
         safe_tag = sanitize_tag(tag)
     except Exception:
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
             f"{original_header}\n\n❌ <b>Error:</b> invalid stack/tag.",
         )
         return
@@ -101,7 +126,9 @@ async def execute_local_update(
         )
     except Exception:
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
             f"{original_header}\n\n❌ <b>Error:</b> invalid stack name.",
         )
         return
@@ -109,78 +136,177 @@ async def execute_local_update(
     node_name = settings.local_node_name
     if not compose_file or stack_dir is None:
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
             f"{original_header}\n\n❌ <b>Error:</b> Compose file not found for "
             f"<code>{html.escape(safe_stack)}</code> in {html.escape(str(settings.docker_stacks_dir))}.",
         )
         return
 
     await edit_telegram_message(
-        settings.telegram_bot_token, chat_id, message_id,
+        settings.telegram_bot_token,
+        chat_id,
+        message_id,
         f"{original_header}\n\n" + t("msg_updating", node=node_name, tag=safe_tag),
     )
 
     try:
-        pre_containers = await inspect_local_containers(stack_dir, compose_file)
+        try:
+            service_images = await update_services(stack_dir, compose_file, safe_tag, image)
+            services = list(service_images)
+        except ImageTagMismatch as exc:
+            await edit_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n"
+                + t(
+                    "msg_pinned_tag",
+                    configured=html.escape(", ".join(exc.configured)),
+                    requested=html.escape(safe_tag),
+                ),
+            )
+            return
+        except ValueError:
+            await edit_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n" + t("msg_config_mismatch"),
+            )
+            return
+        pre_containers = [
+            c
+            for c in await inspect_local_containers(stack_dir, compose_file)
+            if c.get("Service") in services
+        ]
+        if not pre_containers or {c.get("Service") for c in pre_containers} != set(services):
+            raise RuntimeError("Cannot create a complete restore point")
+        # Back up the running IDs onto the refs that the resolved configuration uses.
+        # This also handles a Compose tag edited before clicking the notification.
+        pre_containers = [dict(c, Image=service_images[c["Service"]]) for c in pre_containers]
         backups = await create_backups(effective_stack, pre_containers)
+        if not backups:
+            raise RuntimeError("Cannot create restore point")
+        action_store.save_restore_point("loc", effective_stack, backups, services)
 
         rc_pull, out_pull, err_pull = await _run(
-            ["docker", "compose", "--project-directory", str(stack_dir),
-             "-f", str(compose_file), "pull"],
-            cwd=str(stack_dir), timeout=settings.docker_timeout_seconds,
+            [
+                "docker",
+                "compose",
+                "--project-directory",
+                str(stack_dir),
+                "-f",
+                str(compose_file),
+                "pull",
+                *services,
+            ],
+            cwd=str(stack_dir),
+            timeout=settings.docker_timeout_seconds,
         )
         if rc_pull != 0:
-            err = (err_pull or out_pull or "pull failed")
+            err = err_pull or out_pull or "pull failed"
             await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
                 f"{original_header}\n\n" + t("msg_pull_error", error=html.escape(err[:1000])),
             )
             return
 
         rc_up, out_up, err_up = await _run(
-            ["docker", "compose", "--project-directory", str(stack_dir),
-             "-f", str(compose_file), "up", "-d", "--remove-orphans"],
-            cwd=str(stack_dir), timeout=settings.docker_timeout_seconds,
+            [
+                "docker",
+                "compose",
+                "--project-directory",
+                str(stack_dir),
+                "-f",
+                str(compose_file),
+                "up",
+                "-d",
+                "--pull",
+                "never",
+                "--no-deps",
+                *services,
+            ],
+            cwd=str(stack_dir),
+            timeout=settings.docker_timeout_seconds,
         )
         if rc_up != 0:
-            err = (err_up or out_up or "up failed")
+            err = err_up or out_up or "up failed"
             logger.warning("Update %s: up failed, attempting auto-rollback", effective_stack)
-            await _auto_rollback(stack_dir, compose_file, backups)
+            rolled_back = await _auto_rollback(stack_dir, compose_file, backups, services)
             await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n" + t("msg_up_error", error=html.escape(err[:1000])),
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n"
+                + t("msg_up_error", error=html.escape(err[:1000]))
+                + "\n\n"
+                + _rollback_message(rolled_back),
             )
             return
 
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
             f"{original_header}\n\n"
             + t("msg_verifying", node=node_name, wait_sec=settings.healthcheck_wait_seconds),
         )
         has_failure, status_summary = await wait_for_healthy(
-            stack_dir, compose_file, settings.healthcheck_wait_seconds
+            stack_dir, compose_file, settings.healthcheck_wait_seconds, services=services
         )
 
         rb_id = action_store.register("rb", "loc", effective_stack, safe_tag, original_header)
         dis_id = action_store.register("ccl", "loc", effective_stack, safe_tag, original_header)
-        buttons = [[
-            {"text": t("btn_rollback"), "callback_data": f"rb:{rb_id}"},
-            {"text": t("btn_dismiss"), "callback_data": f"ccl:{dis_id}"},
-        ]]
-        if not has_failure:
+        buttons = [
+            [
+                {"text": t("btn_rollback"), "callback_data": f"rb:{rb_id}"},
+                {"text": t("btn_dismiss"), "callback_data": f"ccl:{dis_id}"},
+            ]
+        ]
+        if has_failure is None:
             await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n" + t("msg_verification_pending", status=status_summary),
+                reply_markup={"inline_keyboard": buttons},
+            )
+        elif has_failure is False:
+            await edit_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
                 f"{original_header}\n\n"
-                + t("msg_success", node=node_name, stack=effective_stack, tag=safe_tag, status=status_summary),
+                + t(
+                    "msg_success",
+                    node=node_name,
+                    stack=effective_stack,
+                    tag=safe_tag,
+                    status=status_summary,
+                ),
                 reply_markup={"inline_keyboard": buttons},
             )
         else:
             logs_txt = await compose_logs(stack_dir, compose_file, 20)
+            rolled_back = await _auto_rollback(stack_dir, compose_file, backups, services)
             await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
                 f"{original_header}\n\n"
-                + t("msg_warning_header", node=node_name, stack=effective_stack,
-                    status=status_summary, logs=html.escape(logs_txt[-1200:])),
+                + t(
+                    "msg_warning_header",
+                    node=node_name,
+                    stack=effective_stack,
+                    status=status_summary,
+                    logs=html.escape(logs_txt[-1200:]),
+                )
+                + "\n\n"
+                + _rollback_message(rolled_back),
                 reply_markup={"inline_keyboard": buttons},
             )
     except asyncio.CancelledError:
@@ -188,27 +314,52 @@ async def execute_local_update(
     except Exception as exc:
         logger.error("Exception during local update %s: %s", safe_stack, type(exc).__name__)
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
             f"{original_header}\n\n❌ <b>Update error:</b> {html.escape(type(exc).__name__)}",
         )
 
 
 async def _auto_rollback(
-    stack_dir: Path, compose_file: Path, backups: Dict[str, str]
-) -> bool:
-    """Best-effort restore of backup tags + `up -d --no-pull`. Returns health."""
+    stack_dir: Path,
+    compose_file: Path,
+    backups: Dict[str, str],
+    services: Optional[list[str]] = None,
+) -> bool | None:
+    """Restore exact image references and fail if any command or health check fails."""
+    if not backups:
+        return False
     try:
         for original, backup in backups.items():
-            await _run(["docker", "tag", backup, original], timeout=60)
-        await _run(
-            ["docker", "compose", "--project-directory", str(stack_dir),
-             "-f", str(compose_file), "up", "-d", "--no-pull", "--remove-orphans"],
-            cwd=str(stack_dir), timeout=settings.docker_timeout_seconds,
+            rc, _, _ = await _run(["docker", "tag", backup, original], timeout=60)
+            if rc:
+                return False
+        rc, _, _ = await _run(
+            [
+                "docker",
+                "compose",
+                "--project-directory",
+                str(stack_dir),
+                "-f",
+                str(compose_file),
+                "up",
+                "-d",
+                "--pull",
+                "never",
+                "--force-recreate",
+                "--no-deps",
+                *(services or []),
+            ],
+            cwd=str(stack_dir),
+            timeout=settings.docker_timeout_seconds,
         )
-        await asyncio.sleep(4)
-        containers = await inspect_local_containers(stack_dir, compose_file)
-        failure, _ = describe_containers(containers)
-        return bool(containers) and not failure
+        if rc:
+            return False
+        failure, _ = await wait_for_healthy(
+            stack_dir, compose_file, settings.healthcheck_wait_seconds, services=services
+        )
+        return None if failure is None else not failure
     except Exception:
         return False
 
@@ -220,128 +371,49 @@ async def execute_local_rollback(
 
     try:
         safe_stack = sanitize_stack_name(stack_name)
-    except Exception:
-        await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Invalid stack name.",
-        )
-        return
-
-    try:
         stack_dir, compose_file, effective_stack = find_local_compose_file(
             settings.docker_stacks_dir, safe_stack
         )
-    except Exception:
-        await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Invalid stack name.",
-        )
-        return
-
-    if not compose_file or stack_dir is None:
-        await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Compose file not found for {html.escape(safe_stack)}.",
-        )
-        return
-
-    await edit_telegram_message(
-        settings.telegram_bot_token, chat_id, message_id,
-        f"{original_header}\n\n" + t("msg_rollback_in_progress"),
-    )
-
-    try:
-        rc, out, _ = await _run(
-            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], timeout=60
-        )
-        all_imgs = out.splitlines() if rc == 0 else []
-        prefix = f":diun-backup-{effective_stack}-"
-        candidates = sorted([i.strip() for i in all_imgs if prefix in i], reverse=True)
-
-        by_repo: Dict[str, str] = {}
-        for ref in candidates:
-            repo = ref.rsplit(":", 1)[0]
-            if repo not in by_repo:
-                by_repo[repo] = ref
-
-        if not by_repo:
-            # legacy single-tag fallback
-            legacy = [i.strip() for i in all_imgs if i.strip().endswith(f":diun-backup-{effective_stack}")]
-            for ref in legacy:
-                repo = ref.rsplit(":", 1)[0]
-                if repo not in by_repo:
-                    by_repo[repo] = ref
-
-        if not by_repo:
+        point = action_store.restore_point("loc", effective_stack)
+        if not compose_file or not point:
             await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n"
-                + t("msg_rollback_not_found", tag=f"diun-backup-{effective_stack}-*"),
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n" + t("msg_rollback_not_found", tag=safe_stack),
             )
             return
-
-        # Current images in stack define which repos to restore (multi-service safe).
-        current = await inspect_local_containers(stack_dir, compose_file)
-        current_repos = set()
-        for c in current:
-            img = c.get("Image") or ""
-            if img and ":diun-backup-" not in img:
-                current_repos.add(img.rsplit(":", 1)[0] if ":" in img else img)
-
-        restored = 0
-        for repo, backup_ref in by_repo.items():
-            if current_repos and repo not in current_repos:
-                continue
-            # Restore the tag the compose file actually references: find current
-            # image ref for this repo, else fall back to repo:latest naming.
-            target = None
-            for c in current:
-                img = c.get("Image") or ""
-                r = img.rsplit(":", 1)[0] if ":" in img else img
-                if r == repo:
-                    target = img
-                    break
-            if target is None:
-                target = f"{repo}:latest"
-            rc_tag, _, _ = await _run(["docker", "tag", backup_ref, target], timeout=60)
-            if rc_tag == 0:
-                restored += 1
-
-        if restored == 0:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n"
-                + t("msg_rollback_not_found", tag=f"diun-backup-{effective_stack}-*"),
+        # Do not restore a snapshot onto a configuration edited since the update.
+        services = set()
+        for ref in point["backups"]:
+            services.update(
+                await update_services(stack_dir, compose_file, parse_image_and_tag(ref)[1], ref)
             )
-            return
-
-        await _run(
-            ["docker", "compose", "--project-directory", str(stack_dir),
-             "-f", str(compose_file), "up", "-d", "--no-pull", "--force-recreate", "--remove-orphans"],
-            cwd=str(stack_dir), timeout=settings.docker_timeout_seconds,
+        if services != set(point["services"]):
+            raise ValueError("Compose services have changed since the restore point")
+        await edit_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n" + t("msg_rollback_in_progress"),
         )
-        await asyncio.sleep(4)
-        post = await inspect_local_containers(stack_dir, compose_file)
-        failure, _ = describe_containers(post)
-        if post and not failure:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n" + t("msg_rollback_success", stack=effective_stack),
-                reply_markup={"inline_keyboard": []},
-            )
-        else:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n" + t("msg_rollback_warning", stack=effective_stack),
-                reply_markup={"inline_keyboard": []},
-            )
+        ok = await _auto_rollback(stack_dir, compose_file, point["backups"], point["services"])
+        await edit_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n" + _manual_rollback_message(ok, safe_stack),
+            reply_markup={"inline_keyboard": []},
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.error("Exception during rollback %s: %s", safe_stack, type(exc).__name__)
+        logger.error("Local rollback failed: %s", type(exc).__name__)
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Rollback error: {html.escape(type(exc).__name__)}",
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n" + t("msg_auto_rollback_failed"),
         )
 
 
@@ -349,116 +421,131 @@ async def execute_local_rollback(
 # REMOTE update / rollback
 # ---------------------------------------------------------------------------
 
+
+async def _restore_remote(host: str, svc: str, backups: Dict[str, str]) -> bool | None:
+    if not backups:
+        return False
+    for original in backups:
+        if not await remote_service_uses_image(host, svc, original, settings.ssh_timeout_seconds):
+            return False
+    for original, backup in backups.items():
+        if not await remote_tag_image(host, backup, original, settings.ssh_timeout_seconds):
+            return False
+    rc, _, _ = await remote_restart_service(host, svc, 60)
+    return rc == 0 and await remote_wait_for_healthy(
+        host, svc, settings.healthcheck_wait_seconds, settings.ssh_timeout_seconds
+    )
+
+
 async def execute_remote_update(
-    chat_id: str | int, message_id: int, service_name: str, tag: str, original_header: str
+    chat_id: str | int,
+    message_id: int,
+    service_name: str,
+    tag: str,
+    original_header: str,
+    image: str = "",
 ) -> None:
     from telegram_client import edit_telegram_message
 
     try:
         svc = sanitize_service_name(service_name)
         safe_tag = sanitize_tag(tag)
-    except Exception:
-        await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Invalid service/tag.",
-        )
-        return
-
-    node_name = settings.remote_node_name
-    host = settings.remote_ssh_host
-    await edit_telegram_message(
-        settings.telegram_bot_token, chat_id, message_id,
-        f"{original_header}\n\n" + t("msg_updating", node=node_name, tag=safe_tag),
-    )
-
-    try:
-        current_image = await remote_inspect_image(host, svc, settings.ssh_timeout_seconds)
-        # FIX: pull the NEW tag, not the stale inspected ref. The tag from DIUN
-        # names the new version; current_image only tells us the repository.
-        if current_image:
-            repo = current_image.rsplit(":", 1)[0] if ":" in current_image else current_image
-            new_image = f"{repo}:{safe_tag}" if safe_tag != "latest" else current_image
-        else:
-            new_image = ""
-
-        backup_name = ""
-        if current_image:
-            repo = current_image.rsplit(":", 1)[0] if ":" in current_image else current_image
-            ts = time.strftime("%Y%m%d%H%M%S")
-            backup_name = f"{repo}:diun-backup-{svc}-{ts}"
-            await remote_tag_image(host, current_image, backup_name, settings.ssh_timeout_seconds)
-
-        if new_image:
-            rc_pull, out_pull, err_pull = await remote_pull_image(
-                host, new_image, settings.docker_timeout_seconds
+        host = settings.remote_ssh_host
+        current = await remote_inspect_image(host, svc, settings.ssh_timeout_seconds)
+        if not current or (image and not same_repository(current, image)):
+            message = t("msg_config_mismatch")
+        elif "@" in current or parse_image_and_tag(current)[1] != safe_tag:
+            message = t(
+                "msg_pinned_tag", configured=html.escape(current), requested=html.escape(safe_tag)
             )
-            if rc_pull != 0:
-                err_msg = err_pull or out_pull or "pull failed"
-                await edit_telegram_message(
-                    settings.telegram_bot_token, chat_id, message_id,
-                    f"{original_header}\n\n❌ <b>Pull error on {html.escape(node_name)}:</b>\n"
-                    f"<pre>{html.escape(err_msg[:1000])}</pre>",
-                )
-                return
+        elif not await remote_service_uses_image(host, svc, current, settings.ssh_timeout_seconds):
+            message = t("msg_remote_unit_mismatch")
         else:
-            logger.warning("Remote update %s: could not determine image, restarting only", svc)
-
-        rc_up, out_up, err_up = await remote_restart_service(host, svc, 60)
-        if rc_up != 0:
-            err_msg = err_up or out_up or "Service restart failed"
+            message = ""
+        if message:
             await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n❌ <b>Update error on {html.escape(node_name)}:</b>\n"
-                f"<pre>{html.escape(err_msg[:1000])}</pre>",
+                settings.telegram_bot_token, chat_id, message_id, f"{original_header}\n\n{message}"
             )
             return
-
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
             f"{original_header}\n\n"
-            + t("msg_verifying", node=node_name, wait_sec=settings.healthcheck_wait_seconds),
+            + t("msg_updating", node=settings.remote_node_name, tag=safe_tag),
         )
-        await asyncio.sleep(settings.healthcheck_wait_seconds)
-
-        active = await remote_service_active(host, svc, settings.ssh_timeout_seconds)
-        p_state, p_health = await remote_container_state(host, svc, settings.ssh_timeout_seconds)
-        is_healthy = (
-            active == "active"
-            and p_state in ("running",)
-            and p_health != "unhealthy"
+        image_id = await remote_inspect_image_id(host, svc, settings.ssh_timeout_seconds)
+        last_colon = current.rfind(":")
+        repo = current[:last_colon] if last_colon > current.rfind("/") else current
+        backup = f"{repo}:diun-backup-{svc}-{time.strftime('%Y%m%d%H%M%S')}"
+        if not image_id or not await remote_tag_image(
+            host, image_id, backup, settings.ssh_timeout_seconds
+        ):
+            raise RuntimeError("Cannot create restore point")
+        backups = {current: backup}
+        action_store.save_restore_point("rem", svc, backups)
+        await remote_prune_backups(host, repo, svc, settings.ssh_timeout_seconds)
+        rc, out, err = await remote_pull_image(host, current, settings.docker_timeout_seconds)
+        if rc:
+            await edit_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n"
+                + t("msg_pull_error", error=html.escape((err or out)[:1000])),
+            )
+            return
+        rc, out, err = await remote_restart_service(host, svc, 60)
+        healthy = rc == 0 and await remote_wait_for_healthy(
+            host, svc, settings.healthcheck_wait_seconds, settings.ssh_timeout_seconds
         )
-
         rb_id = action_store.register("rb", "rem", svc, safe_tag, original_header)
         dis_id = action_store.register("ccl", "rem", svc, safe_tag, original_header)
-        buttons = [[
-            {"text": t("btn_rollback"), "callback_data": f"rb:{rb_id}"},
-            {"text": t("btn_dismiss"), "callback_data": f"ccl:{dis_id}"},
-        ]]
-        if is_healthy:
-            status_desc = f"Active (State: {p_state}, Health: {p_health})"
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n"
-                + t("msg_success", node=node_name, stack=svc, tag=safe_tag, status=html.escape(status_desc)),
-                reply_markup={"inline_keyboard": buttons},
+        buttons = {
+            "inline_keyboard": [
+                [
+                    {"text": t("btn_rollback"), "callback_data": f"rb:{rb_id}"},
+                    {"text": t("btn_dismiss"), "callback_data": f"ccl:{dis_id}"},
+                ]
+            ]
+        }
+        if healthy is None:
+            text = t("msg_verification_pending", status=html.escape(svc))
+        elif healthy is True:
+            text = t(
+                "msg_success",
+                node=settings.remote_node_name,
+                stack=svc,
+                tag=safe_tag,
+                status="running / healthy",
             )
         else:
-            logs_txt = await remote_logs(host, svc, settings.ssh_timeout_seconds)
-            status_desc = f"Service: {active} (Podman: {p_state})"
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n"
-                + t("msg_warning_header", node=node_name, stack=svc,
-                    status=html.escape(status_desc), logs=html.escape(logs_txt[-1200:])),
-                reply_markup={"inline_keyboard": buttons},
+            logs = await remote_logs(host, svc, settings.ssh_timeout_seconds)
+            ok = await _restore_remote(host, svc, backups)
+            text = t(
+                "msg_warning_header",
+                node=settings.remote_node_name,
+                stack=svc,
+                status=html.escape((err or out or "health check failed")[:500]),
+                logs=html.escape(logs[-1200:]),
             )
+            text += "\n\n" + _rollback_message(ok)
+        await edit_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n{text}",
+            reply_markup=buttons,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.error("Exception during remote update %s: %s", service_name, type(exc).__name__)
+        logger.error("Remote update failed: %s", type(exc).__name__)
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ <b>Remote update error:</b> {html.escape(type(exc).__name__)}",
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n❌ Remote update error: {html.escape(type(exc).__name__)}",
         )
 
 
@@ -469,96 +556,43 @@ async def execute_remote_rollback(
 
     try:
         svc = sanitize_service_name(service_name)
-    except Exception:
+        point = action_store.restore_point("rem", svc)
+        if not point:
+            await edit_telegram_message(
+                settings.telegram_bot_token,
+                chat_id,
+                message_id,
+                f"{original_header}\n\n" + t("msg_rollback_not_found", tag=svc),
+            )
+            return
+        current = await remote_inspect_image(
+            settings.remote_ssh_host, svc, settings.ssh_timeout_seconds
+        )
+        if current not in point["backups"]:
+            raise ValueError("Remote image changed since the restore point")
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Invalid service name.",
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n" + t("msg_rollback_in_progress"),
         )
-        return
-
-    host = settings.remote_ssh_host
-    await edit_telegram_message(
-        settings.telegram_bot_token, chat_id, message_id,
-        f"{original_header}\n\n" + t("msg_rollback_in_progress"),
-    )
-
-    try:
-        current_image = await remote_inspect_image(host, svc, settings.ssh_timeout_seconds)
-        if not current_image:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n❌ Image not found for {html.escape(svc)}.",
-            )
-            return
-
-        repo = current_image.rsplit(":", 1)[0] if ":" in current_image else current_image
-        rc, out, _ = await run_remote_ssh(
-            host, "podman images --format '{{.Repository}}:{{.Tag}}'",
-            settings.ssh_timeout_seconds,
+        ok = await _restore_remote(settings.remote_ssh_host, svc, point["backups"])
+        await edit_telegram_message(
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n" + _manual_rollback_message(ok, svc),
+            reply_markup={"inline_keyboard": []},
         )
-        prefix = f":diun-backup-{svc}-"
-        candidates = sorted(
-            [l.strip() for l in (out.splitlines() if rc == 0 else []) if prefix in l],
-            reverse=True,
-        )
-        if not candidates:
-            rc2, out2, _ = await run_remote_ssh(
-                host, "podman images --format '{{.Repository}}:{{.Tag}}'",
-                settings.ssh_timeout_seconds,
-            )
-            legacy = [l.strip() for l in (out2.splitlines() if rc2 == 0 else [])
-                      if l.strip().endswith(f":diun-backup-{svc}")]
-            candidates = legacy
-        if not candidates:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n❌ <b>Rollback failed:</b> no backup for {html.escape(svc)}.",
-            )
-            return
-
-        # Retag newest backup onto the CURRENT image ref (what the Quadlet runs),
-        # then restart. No pull involved.
-        newest = candidates[0]
-        if newest.rsplit(":", 1)[0] != repo:
-            repo = newest.rsplit(":", 1)[0]
-        ok = await remote_tag_image(host, newest, current_image, settings.ssh_timeout_seconds)
-        if not ok:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n❌ <b>Rollback error on {html.escape(settings.remote_node_name)}:</b>\n"
-                f"<pre>retag failed</pre>",
-            )
-            return
-        rc_rb, _, err_rb = await remote_restart_service(host, svc, 60)
-        if rc_rb != 0:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n❌ <b>Rollback error on {html.escape(settings.remote_node_name)}:</b>\n"
-                f"<pre>{html.escape((err_rb or 'restart failed')[:1000])}</pre>",
-            )
-            return
-
-        await asyncio.sleep(4)
-        active = await remote_service_active(host, svc, settings.ssh_timeout_seconds)
-        if active == "active":
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n" + t("msg_rollback_success", stack=svc),
-                reply_markup={"inline_keyboard": []},
-            )
-        else:
-            await edit_telegram_message(
-                settings.telegram_bot_token, chat_id, message_id,
-                f"{original_header}\n\n" + t("msg_rollback_warning", stack=svc),
-                reply_markup={"inline_keyboard": []},
-            )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.error("Exception during remote rollback %s: %s", service_name, type(exc).__name__)
+        logger.error("Remote rollback failed: %s", type(exc).__name__)
         await edit_telegram_message(
-            settings.telegram_bot_token, chat_id, message_id,
-            f"{original_header}\n\n❌ Rollback error: {html.escape(type(exc).__name__)}",
+            settings.telegram_bot_token,
+            chat_id,
+            message_id,
+            f"{original_header}\n\n" + t("msg_auto_rollback_failed"),
         )
 
 
@@ -653,9 +687,9 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
 
     buttons = []
     if local_stack and remote_service and settings.remote_enabled:
-        up_loc = action_store.register("upd", "loc", local_stack, tag, header_plain)
-        up_rem = action_store.register("upd", "rem", remote_service, tag, header_plain)
-        skip = action_store.register("ccl", "all", local_stack, tag, header_plain)
+        up_loc = action_store.register("upd", "loc", local_stack, tag, header_plain, image=payload.image)
+        up_rem = action_store.register("upd", "rem", remote_service, tag, header_plain, image=payload.image)
+        skip = action_store.register("ccl", "all", local_stack, tag, header_plain, image=payload.image)
         buttons.append([
             {"text": t("btn_update_node", node=settings.local_node_name),
              "callback_data": f"upd:{up_loc}"},
@@ -664,15 +698,15 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
         ])
         buttons.append([{"text": t("btn_skip"), "callback_data": f"ccl:{skip}"}])
     elif local_stack:
-        up_loc = action_store.register("upd", "loc", local_stack, tag, header_plain)
-        skip = action_store.register("ccl", "loc", local_stack, tag, header_plain)
+        up_loc = action_store.register("upd", "loc", local_stack, tag, header_plain, image=payload.image)
+        skip = action_store.register("ccl", "loc", local_stack, tag, header_plain, image=payload.image)
         buttons.append([
             {"text": t("btn_update_now"), "callback_data": f"upd:{up_loc}"},
             {"text": t("btn_skip"), "callback_data": f"ccl:{skip}"},
         ])
     elif remote_service and settings.remote_enabled:
-        up_rem = action_store.register("upd", "rem", remote_service, tag, header_plain)
-        skip = action_store.register("ccl", "rem", remote_service, tag, header_plain)
+        up_rem = action_store.register("upd", "rem", remote_service, tag, header_plain, image=payload.image)
+        skip = action_store.register("ccl", "rem", remote_service, tag, header_plain, image=payload.image)
         buttons.append([
             {"text": t("btn_update_remote", node=settings.remote_node_name),
              "callback_data": f"upd:{up_rem}"},
@@ -728,7 +762,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="DiunTap - Interactive Docker Updates for DIUN", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="DiunTap - Interactive Docker Updates for DIUN", version="1.1.0", lifespan=lifespan)
 
 
 @app.post("/webhook/diun")
@@ -742,13 +776,17 @@ async def webhook_diun(request: Request):
             logger.warning("Rejected DIUN webhook: invalid secret")
             raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > 8192:
+            raise HTTPException(status_code=413, detail="Payload too large")
     try:
-        body = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
-
-    if isinstance(body, dict) and len(str(body)) > 8192:
-        raise HTTPException(status_code=413, detail="Payload too large")
+        body = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON object")
 
     try:
         payload = DiunWebhookPayload(**body)
@@ -771,7 +809,7 @@ async def health():
     return {
         "status": "ok",
         "app": "DiunTap",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "telegram_configured": settings.telegram_configured,
         "github_token_configured": bool(settings.github_token),
         "webhook_auth_enabled": settings.webhook_auth_enabled,
@@ -798,7 +836,7 @@ async def ready(request: Request):
     return {
         "status": "ok",
         "app": "DiunTap",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "telegram_configured": settings.telegram_configured,
         "github_token_configured": bool(settings.github_token),
         "webhook_auth_enabled": settings.webhook_auth_enabled,

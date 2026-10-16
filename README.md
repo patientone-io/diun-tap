@@ -100,13 +100,23 @@
 * 🔑 **Optional Webhook Authentication:** Set `DIUN_WEBHOOK_SECRET` and DIUN signs each delivery with header `X-Diun-Secret` (or `?token=`). Wrong secret → `401`. Unset → legacy mode with a clear `WARNING` in logs (smooth migration).
 * 👥 **Group-Safe Telegram Auth:** Only `from_user.id` is verified against `TELEGRAM_ALLOWED_USER_IDS` (falls back to `TELEGRAM_CHAT_ID`). Safe to use the bot in groups — strangers tapping your buttons get `Unauthorized`.
 * 🩺 **Post-Update Healthcheck & Auto-Diagnostics:** Polls container state until stable (or timeout). If a container exits or reports `unhealthy`, DiunTap captures the last 20 lines of logs, sends them to Telegram and attempts an automatic rollback.
-* ⏪ **1-Click Rollback:** Before pulling, every running image is tagged as a timestamped backup (`:diun-backup-<service>-<timestamp>`, retention: newest 3 per repo, multi-service aware). Rollback restores with `up -d --no-pull`, so a broken `:latest` is never re-pulled by accident.
+* ⏪ **1-Click Rollback:** Before pulling, each selected running image ID gets a timestamped backup (local tags include a reference hash; newest 3 per original reference, multi-service aware). Rollback restores with `up -d --pull never`, so a broken `:latest` is never re-pulled by accident.
 * 🧩 **Modular Hardened Codebase:** Strict input allow-lists (no shell injection into SSH), enforced subprocess timeouts, non-blocking filesystem scans, serialized per-stack updates (double-tap safe).
 * 🌐 **Multi-Node Ready (Optional):** Supports local Docker Compose stacks out-of-the-box, with built-in optional support for remote nodes via SSH (e.g. Podman Quadlets or remote VPS). Remote commands run with `StrictHostKeyChecking=yes`.
 * 🌍 **Localization:** Built-in support for English (`LANGUAGE=en`) and Polish (`LANGUAGE=pl`).
 * 📁 **Extensible Image Mappings:** Includes built-in mappings for dozens of popular homelab services, with support for custom overrides via `mappings.yaml`.
 
 ---
+
+### Update and restore behavior
+
+DiunTap updates only services whose complete image repository and configured tag match the notification. It does not change Compose or Quadlet files. To move from a pinned `v1` to `v2`, edit the configuration first. Digest-pinned services are skipped. Unrelated Compose services are not pulled or recreated.
+
+A successful health check requires two consecutive healthy samples; `starting` is still pending. The default observation window is 60 seconds. Healthchecked containers get at least 60 seconds even with the legacy `HEALTHCHECK_WAIT_SECONDS=6`. A timeout or unavailable status is inconclusive: it produces a pending message without automatic rollback. Confirmed failures (`unhealthy`, `exited`, `dead`, `restarting`, or a failed remote unit), or a failed startup command, trigger an automatic rollback. Rollback restores container images, not application data or database migrations.
+
+Telegram actions and the latest restore point per target live in SQLite. Mount `diuntap-state:/data` as shown below; outside Docker, set `DIUNTAP_STATE_DIR` (default `./data`). New buttons survive restarts for up to seven days, subject to the 4096-action limit. Buttons sent by older versions cannot be recovered. Rollback requires a restore point created by this version and restores the latest recorded update for the target.
+
+For remote Quadlets, `ContainerName=` must match the service basename. The default pull policy (`missing`), explicit `Pull=missing`, and `Pull=never` are supported without requiring edits to existing units. DiunTap pulls explicitly before restarting. The loaded unit must use the same repository and tag (Docker Hub prefixes are normalized); `always` and `newer` are rejected because they can overwrite a restored local image. See [Podman Quadlet documentation](https://docs.podman.io/en/stable/markdown/podman-systemd.unit.5.html).
 
 ### 🚀 Quickstart
 
@@ -151,6 +161,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # 1:1 mount matching DOCKER_STACKS_DIR
+      - diuntap-state:/data
 
   diun:
     image: crazymax/diun:latest
@@ -170,6 +181,9 @@ services:
       - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
     depends_on:
       - diun-tap
+
+volumes:
+  diuntap-state:
 ```
 
 #### Option B: Standalone DiunTap (Existing DIUN)
@@ -204,6 +218,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # 1:1 mount matching DOCKER_STACKS_DIR
+      - diuntap-state:/data
+
+volumes:
+  diuntap-state:
 ```
 
 2. Point DIUN to DiunTap:
@@ -245,7 +263,7 @@ Verify service health (minimal public surface; details live behind the gated `/r
 
 ```bash
 curl http://localhost:5000/health
-# {"status":"ok","app":"DiunTap","version":"1.0.0","telegram_configured":true,...}
+# {"status":"ok","app":"DiunTap","version":"1.1.0","telegram_configured":true,...}
 ```
 
 > **Tip:** You can obtain a bot token from [@BotFather](https://t.me/BotFather) and your chat ID from [@userinfobot](https://t.me/userinfobot). For group use, list every allowed tapper in `TELEGRAM_ALLOWED_USER_IDS`.
@@ -285,7 +303,8 @@ All settings can be configured via environment variables or a `.env` file:
 | `LOCAL_NODE_NAME` | Display name for the local Docker host | `Local` |
 | `DOCKER_STACKS_DIR` | Directory where Docker Compose stacks are stored (mounted 1:1) | `/srv/docker` |
 | `DOCKER_GID` | Host group id of `/var/run/docker.sock` (`stat -c %g …`); wired to `group_add` | `999` |
-| `HEALTHCHECK_WAIT_SECONDS` | How long to poll container health after deployment | `6` |
+| `HEALTHCHECK_WAIT_SECONDS` | Observation window (timeout stays pending; healthchecks get at least 60s) | `60` |
+| `DIUNTAP_STATE_DIR` | Persistent action and restore database directory | `/data` in Docker; `./data` locally |
 | `SSH_TIMEOUT_SECONDS` | Timeout for a single SSH call | `30` |
 | `DOCKER_TIMEOUT_SECONDS` | Timeout for `pull` / `up -d` | `180` |
 | `WEBHOOK_PORT` | Port for the incoming DIUN webhook server | `5000` |
@@ -393,13 +412,23 @@ Mount the file into your container or set `MAPPINGS_FILE=/config/mappings.yaml`.
 * 🔑 **Opcjonalna Autoryzacja Webhooka:** Ustaw `DIUN_WEBHOOK_SECRET`, a DIUN podpisze każde wywołanie nagłówkiem `X-Diun-Secret` (lub `?token=`). Zły sekret → `401`. Brak zmiennej → tryb legacy z wyraźnym `WARNING` w logach (płynna migracja).
 * 👥 **Bezpieczna Autoryzacja w Grupach:** Weryfikowane jest **wyłącznie** `from_user.id` klikającego względem `TELEGRAM_ALLOWED_USER_IDS` (fallback do `TELEGRAM_CHAT_ID`). Bota można bezpiecznie używać w grupach — obcy klikający dostaje `Brak uprawnień`.
 * 🩺 **Automatyczny Healthcheck i Diagnostyka:** Stan kontenerów jest odpytywany aż do stabilizacji (lub timeoutu). Jeśli usługa zgłosi błąd, bot przechwytuje ostatnie 20 linijek logów, wysyła je na czat i próbuje automatycznego rollbacku.
-* ⏪ **1-Click Rollback:** Przed pobraniem każdy działający obraz dostaje timestampowany tag backupu (`:diun-backup-<service>-<timestamp>`, retencja: 3 najnowsze na repo, obsługa stosów multi-service). Rollback stawia kontenery przez `up -d --no-pull`, więc uszkodzony `:latest` nigdy nie zostanie przypadkowo dociągnięty.
+* ⏪ **1-Click Rollback:** Przed pobraniem identyfikator każdego aktualizowanego obrazu dostaje tag backupu (lokalnie z timestampem i skrótem referencji; retencja: 3 najnowsze na referencję, obsługa stosów multi-service). Rollback stawia kontenery przez `up -d --pull never`, więc uszkodzony `:latest` nigdy nie zostanie przypadkowo dociągnięty.
 * 🧩 **Modularna, Utwardzona Baza Kodu:** Surowe allow-listy danych wejściowych (brak wstrzyknięć do shella po SSH), wymuszone timeouty podprocesów, nieblokujące skanowanie plików, serializacja aktualizacji na stos (bezpieczny podwójny klik).
 * 🌐 **Wsparcie Multi-Node (Opcjonalnie):** Domyślnie lokalny Docker Compose, z opcją obsługi zdalnych węzłów po SSH (np. Podman Quadlets czy zdalny serwer VPS). Komendy zdalne działają z `StrictHostKeyChecking=yes`.
 * 🌍 **Wielojęzyczność:** Pełne wsparcie dla języka polskiego (`LANGUAGE=pl`) oraz angielskiego (`LANGUAGE=en`).
 * 📁 **Rozszerzalne Mapowania Obrazów:** Baza popularnych serwisów z możliwością dodania własnych definicji przez `mappings.yaml`.
 
 ---
+
+### Zasady aktualizacji i przywracania
+
+DiunTap aktualizuje tylko usługi, których pełna nazwa repozytorium obrazu i skonfigurowany tag pasują do powiadomienia. Nie zmienia plików Compose ani Quadletów. Przejście z przypiętego `v1` na `v2` wymaga wcześniejszej zmiany konfiguracji. Usługi przypięte do digestu są pomijane. Pozostałe usługi Compose nie są pobierane ani odtwarzane.
+
+Healthcheck wymaga dwóch kolejnych poprawnych odczytów; `starting` oznacza oczekiwanie. Domyślny czas obserwacji to 60 sekund. Kontenery z healthcheckiem dostają co najmniej 60 sekund, także przy starym `HEALTHCHECK_WAIT_SECONDS=6`. Timeout lub brak odczytu oznacza wynik nierozstrzygnięty i komunikat o oczekiwaniu, bez automatycznego rollbacku. Dopiero potwierdzona awaria (`unhealthy`, `exited`, `dead`, `restarting` lub zdalna jednostka w stanie `failed`) albo błąd polecenia uruchomienia powoduje próbę automatycznego rollbacku. Rollback przywraca obrazy kontenerów, ale nie dane aplikacji ani migracje bazy danych.
+
+Akcje Telegrama i ostatni punkt przywracania dla każdego celu są zapisywane w SQLite. Zamontuj `diuntap-state:/data` jak w przykładach poniżej; poza Dockerem ustaw `DIUNTAP_STATE_DIR` (domyślnie `./data`). Nowe przyciski przetrwają restart przez maksymalnie siedem dni, z limitem 4096 akcji. Przycisków wysłanych przez starszą wersję nie da się odzyskać. Rollback wymaga punktu przywracania utworzonego przez tę wersję i przywraca ostatnią zapisaną aktualizację danego celu.
+
+W zdalnych Quadletach `ContainerName=` musi odpowiadać nazwie usługi bez rozszerzenia. Obsługiwane są domyślna polityka `missing`, jawne `Pull=missing` i `Pull=never`, bez wymuszania zmian istniejących jednostek. DiunTap sam pobiera obraz przed restartem. Załadowana jednostka musi wskazywać to samo repozytorium i tag (prefiksy Docker Huba są normalizowane); `always` i `newer` są odrzucane, bo mogłyby nadpisać przywrócony lokalny obraz. Zobacz [dokumentację Quadletów Podmana](https://docs.podman.io/en/stable/markdown/podman-systemd.unit.5.html).
 
 ### 🚀 Szybki Start
 
@@ -444,6 +473,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # Montowanie 1:1 zgodne z DOCKER_STACKS_DIR
+      - diuntap-state:/data
 
   diun:
     image: crazymax/diun:latest
@@ -463,6 +493,9 @@ services:
       - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
     depends_on:
       - diun-tap
+
+volumes:
+  diuntap-state:
 ```
 
 #### Opcja B: Samodzielny DiunTap (podłączenie do istniejącego DIUN)
@@ -497,6 +530,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/docker:/srv/docker # Montowanie 1:1 zgodne z DOCKER_STACKS_DIR
+      - diuntap-state:/data
+
+volumes:
+  diuntap-state:
 ```
 
 2. Skieruj DIUN na DiunTap:
@@ -538,7 +575,7 @@ Sprawdź stan usługi (minimalna publiczna odpowiedź; szczegóły w bramkowanym
 
 ```bash
 curl http://localhost:5000/health
-# {"status":"ok","app":"DiunTap","version":"1.0.0","telegram_configured":true,...}
+# {"status":"ok","app":"DiunTap","version":"1.1.0","telegram_configured":true,...}
 ```
 
 > **Wskazówka:** Token bota uzyskasz z [@BotFather](https://t.me/BotFather), a swój identyfikator z [@userinfobot](https://t.me/userinfobot). Do użycia w grupach wpisz wszystkich uprawnionych w `TELEGRAM_ALLOWED_USER_IDS`.
@@ -578,7 +615,8 @@ Wszystkie ustawienia przez zmienne środowiskowe lub plik `.env`:
 | `LOCAL_NODE_NAME` | Nazwa wyświetlana lokalnego hosta Docker | `Local` |
 | `DOCKER_STACKS_DIR` | Katalog ze stosami Compose (montowany 1:1) | `/srv/docker` |
 | `DOCKER_GID` | GID gniazda `/var/run/docker.sock` z hosta (`stat -c %g …`); podpinany przez `group_add` | `999` |
-| `HEALTHCHECK_WAIT_SECONDS` | Jak długo odpytywać health kontenerów po wdrożeniu | `6` |
+| `HEALTHCHECK_WAIT_SECONDS` | Czas obserwacji (timeout pozostaje nierozstrzygnięty; healthcheck ma minimum 60s) | `60` |
+| `DIUNTAP_STATE_DIR` | Katalog trwałej bazy akcji i punktów przywracania | `/data` w Dockerze; `./data` lokalnie |
 | `SSH_TIMEOUT_SECONDS` | Timeout pojedynczego wywołania SSH | `30` |
 | `DOCKER_TIMEOUT_SECONDS` | Timeout `pull` / `up -d` | `180` |
 | `WEBHOOK_PORT` | Port serwera webhooków DIUN | `5000` |

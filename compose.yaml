@@ -23,6 +23,7 @@ services:
     env_file:
       - .env
     volumes:
+      - diuntap-state:/data
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount your host directory containing docker compose stacks (1:1 mount):
       - ${DOCKER_STACKS_DIR:-/srv/docker}:${DOCKER_STACKS_DIR:-/srv/docker}
@@ -63,3 +64,6 @@ services:
   #     # - "DIUN_NOTIF_WEBHOOK_HEADERS=X-Diun-Secret: your_secret_here"
   #   depends_on:
   #     - diun-tap
+
+volumes:
+  diuntap-state:

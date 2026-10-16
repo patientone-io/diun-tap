@@ -43,3 +43,11 @@ class TelegramError(DiunTapError):
 
 class GitHubError(DiunTapError):
     pass
+
+
+class ImageTagMismatch(ValueError):
+    """The repository exists in the configuration, but its tag is pinned elsewhere."""
+
+    def __init__(self, configured: list[str]):
+        self.configured = configured
+        super().__init__("Notification tag differs from configured image reference")

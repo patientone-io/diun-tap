@@ -16,3 +16,6 @@ env/
 # Application data & logs
 diun-data/
 *.log
+
+# Persistent local action and rollback state
+data/

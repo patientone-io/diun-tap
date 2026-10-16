@@ -23,8 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && (getent group "${DOCKER_GID}" || groupadd -g "${DOCKER_GID}" docker-host) \
     && useradd -u 1000 -g diuntap -d /home/diuntap -m -s /bin/bash diuntap \
     && usermod -aG "${DOCKER_GID}" diuntap \
-    && mkdir -p /srv/docker /config /home/diuntap/.ssh \
-    && chown -R 1000:1000 /app /srv/docker /config /home/diuntap
+    && mkdir -p /srv/docker /config /data /home/diuntap/.ssh \
+    && chown -R 1000:1000 /app /srv/docker /config /data /home/diuntap
 
 COPY --chown=1000:1000 requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -37,6 +37,7 @@ EXPOSE 5000
 
 ENV PYTHONUNBUFFERED=1 \
     DOCKER_STACKS_DIR=/srv/docker \
+    DIUNTAP_STATE_DIR=/data \
     HOME=/home/diuntap
 
 USER diuntap
