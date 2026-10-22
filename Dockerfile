@@ -27,7 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R 1000:1000 /app /srv/docker /config /data /home/diuntap
 
 COPY --chown=1000:1000 requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade "pip>=26.2.2" && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=1000:1000 main.py app.py config.py models.py security.py dedup.py \
     github_client.py telegram_client.py polling.py docker_local.py remote_ssh.py \

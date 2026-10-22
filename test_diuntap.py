@@ -156,6 +156,13 @@ class TestSecurity(unittest.TestCase):
         with self.assertRaises(Exception):
             verify_webhook_secret("", "s3cret")
 
+    def test_certifi_trust_store_revokes_compromised_cas(self):
+        import certifi
+
+        # Ensure certifi is updated past the eMudhra/emSign incident (>= 2026.10.19)
+        version_parts = [int(p) for p in certifi.__version__.split(".")]
+        self.assertGreaterEqual(version_parts, [2026, 10, 19])
+
 
 class TestActions(unittest.TestCase):
     def test_opaque_store_roundtrip_full_tag(self):
