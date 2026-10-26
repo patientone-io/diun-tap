@@ -109,6 +109,7 @@ class PendingAction:
     header: str  # plain-text header snapshot (already escaped at render time)
     created: float
     image: str = ""
+    restore_id: str = ""
 
 
 class ActionStore:
@@ -147,10 +148,11 @@ class ActionStore:
         tag: str,
         header: str,
         image: str = "",
+        restore_id: str = "",
     ) -> str:
         self.evict()
         action_id = secrets.token_urlsafe(16)
-        action = PendingAction(kind, node, target, tag, header, time.time(), image)
+        action = PendingAction(kind, node, target, tag, header, time.time(), image, restore_id)
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO actions VALUES (?, ?, ?)",
@@ -177,12 +179,17 @@ class ActionStore:
 
     def save_restore_point(
         self, node: str, target: str, backups: Dict[str, str], services: Optional[list[str]] = None
-    ) -> None:
+    ) -> str:
+        # JSON payload extension: old databases remain readable without schema changes.
+        restore_id = secrets.token_urlsafe(16)
+        payload = {"backups": backups, "services": services or [], "restore_id": restore_id}
         with self._lock, self._db:
             self._db.execute(
                 "INSERT OR REPLACE INTO restores VALUES (?, ?, ?)",
-                (node, target, json.dumps({"backups": backups, "services": services or []})),
+                (node, target, json.dumps(payload)),
             )
+
+        return restore_id
 
     def restore_point(self, node: str, target: str) -> Optional[dict]:
         with self._lock:

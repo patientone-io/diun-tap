@@ -189,7 +189,7 @@ async def execute_local_update(
         backups = await create_backups(effective_stack, pre_containers)
         if not backups:
             raise RuntimeError("Cannot create restore point")
-        action_store.save_restore_point("loc", effective_stack, backups, services)
+        restore_id = action_store.save_restore_point("loc", effective_stack, backups, services)
 
         rc_pull, out_pull, err_pull = await _run(
             [
@@ -259,7 +259,9 @@ async def execute_local_update(
             stack_dir, compose_file, settings.healthcheck_wait_seconds, services=services
         )
 
-        rb_id = action_store.register("rb", "loc", effective_stack, safe_tag, original_header)
+        rb_id = action_store.register(
+            "rb", "loc", effective_stack, safe_tag, original_header, restore_id=restore_id
+        )
         dis_id = action_store.register("ccl", "loc", effective_stack, safe_tag, original_header)
         buttons = [
             [
@@ -365,7 +367,8 @@ async def _auto_rollback(
 
 
 async def execute_local_rollback(
-    chat_id: str | int, message_id: int, stack_name: str, tag: str, original_header: str
+    chat_id: str | int, message_id: int, stack_name: str, tag: str, original_header: str,
+    restore_id: str = "",
 ) -> None:
     from telegram_client import edit_telegram_message
 
@@ -381,6 +384,13 @@ async def execute_local_rollback(
                 chat_id,
                 message_id,
                 f"{original_header}\n\n" + t("msg_rollback_not_found", tag=safe_stack),
+            )
+            return
+        if not restore_id or restore_id != point.get("restore_id"):
+            await edit_telegram_message(
+                settings.telegram_bot_token, chat_id, message_id,
+                f"{original_header}\n\n" + t("msg_rollback_stale"),
+                reply_markup={"inline_keyboard": []},
             )
             return
         # Do not restore a snapshot onto a configuration edited since the update.
@@ -483,7 +493,7 @@ async def execute_remote_update(
         ):
             raise RuntimeError("Cannot create restore point")
         backups = {current: backup}
-        action_store.save_restore_point("rem", svc, backups)
+        restore_id = action_store.save_restore_point("rem", svc, backups)
         await remote_prune_backups(host, repo, svc, settings.ssh_timeout_seconds)
         rc, out, err = await remote_pull_image(host, current, settings.docker_timeout_seconds)
         if rc:
@@ -499,7 +509,9 @@ async def execute_remote_update(
         healthy = rc == 0 and await remote_wait_for_healthy(
             host, svc, settings.healthcheck_wait_seconds, settings.ssh_timeout_seconds
         )
-        rb_id = action_store.register("rb", "rem", svc, safe_tag, original_header)
+        rb_id = action_store.register(
+            "rb", "rem", svc, safe_tag, original_header, restore_id=restore_id
+        )
         dis_id = action_store.register("ccl", "rem", svc, safe_tag, original_header)
         buttons = {
             "inline_keyboard": [
@@ -550,7 +562,8 @@ async def execute_remote_update(
 
 
 async def execute_remote_rollback(
-    chat_id: str | int, message_id: int, service_name: str, tag: str, original_header: str
+    chat_id: str | int, message_id: int, service_name: str, tag: str, original_header: str,
+    restore_id: str = "",
 ) -> None:
     from telegram_client import edit_telegram_message
 
@@ -563,6 +576,13 @@ async def execute_remote_rollback(
                 chat_id,
                 message_id,
                 f"{original_header}\n\n" + t("msg_rollback_not_found", tag=svc),
+            )
+            return
+        if not restore_id or restore_id != point.get("restore_id"):
+            await edit_telegram_message(
+                settings.telegram_bot_token, chat_id, message_id,
+                f"{original_header}\n\n" + t("msg_rollback_stale"),
+                reply_markup={"inline_keyboard": []},
             )
             return
         current = await remote_inspect_image(
@@ -601,14 +621,12 @@ async def execute_remote_rollback(
 # ---------------------------------------------------------------------------
 
 async def process_diun_notification(payload: DiunWebhookPayload) -> None:
-    from telegram_client import send_telegram_message
-
     img_name, tag = parse_image_and_tag(payload.image)
     logger.info("Received DIUN webhook: image=%s, tag=%s, status=%s", img_name, tag, payload.status)
 
     # Pin/freeze filters: frozen images never produce notifications (checked
     # before dedup so they don't pollute the cache either).
-    from filters import match_excluded_image, match_pinned_target, normalize_patterns
+    from filters import match_excluded_image, normalize_patterns
 
     excluded_hit = match_excluded_image(
         payload.image, img_name, normalize_patterns(settings.exclude_images)
@@ -618,9 +636,20 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
         return
 
     dedup_key = f"{payload.image}:{tag}:{payload.status}"
-    if await dedup.check_and_mark(dedup_key):
+    if not await dedup.reserve(dedup_key):
         logger.info("Duplicate notification ignored for %s", dedup_key)
         return
+
+    delivered = False
+    try:
+        delivered = await _send_diun_notification(payload, img_name, tag)
+    finally:
+        await dedup.finish(dedup_key, delivered)
+
+
+async def _send_diun_notification(payload: DiunWebhookPayload, img_name: str, tag: str) -> bool:
+    from telegram_client import send_telegram_message
+    from filters import match_pinned_target, normalize_patterns
 
     github_repo = resolve_github_repo(img_name, IMAGE_MAPPINGS)
     release_info = None
@@ -642,7 +671,7 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
     )
     if pinned_hit:
         logger.info("Notification skipped (PINNED_STACKS, target=%s) for %s", pinned_hit, payload.image)
-        return
+        return False
 
     title_key = "title_update" if payload.status == "update" else "title_new"
     msg_lines = [
@@ -717,10 +746,11 @@ async def process_diun_notification(payload: DiunWebhookPayload) -> None:
         buttons.append([{"text": t("btn_open_github"), "url": release_info["html_url"]}])
 
     reply_markup = {"inline_keyboard": buttons} if buttons else None
-    await send_telegram_message(
+    result = await send_telegram_message(
         settings.telegram_bot_token, settings.telegram_chat_id,
         full_message, reply_markup=reply_markup,
     )
+    return bool(result and result.get("ok"))
 
 
 # ---------------------------------------------------------------------------

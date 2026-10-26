@@ -307,6 +307,10 @@ class Orchestration(unittest.IsolatedAsyncioTestCase):
         restore.assert_not_awaited()
         self.assertIn("pending", self.edit.await_args.args[3])
         self.assertNotIn("Successfully", self.edit.await_args.args[3])
+        callback = self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        action = self.store.resolve(callback.split(":", 1)[1])
+        self.assertEqual(action.restore_id, self.store.restore_point("loc", "app")["restore_id"])
+        self.assertTrue(action.restore_id)
 
     async def test_pending_remote_verification_never_rolls_back(self):
         with (
@@ -323,6 +327,10 @@ class Orchestration(unittest.IsolatedAsyncioTestCase):
         restore.assert_not_awaited()
         self.assertIn("pending", self.edit.await_args.args[3])
         self.assertNotIn("Successfully", self.edit.await_args.args[3])
+        callback = self.edit.await_args.kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        action = self.store.resolve(callback.split(":", 1)[1])
+        self.assertEqual(action.restore_id, self.store.restore_point("rem", "app")["restore_id"])
+        self.assertTrue(action.restore_id)
 
     async def test_pinned_tag_message_names_actual_and_requested_image(self):
         from errors import ImageTagMismatch
@@ -368,26 +376,26 @@ class Orchestration(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_rollback_uses_persisted_exact_refs_and_reports_failure(self):
         backups = {"registry:5000/app:v2": "registry:5000/app:backup"}
-        self.store.save_restore_point("loc", "app", backups, ["app"])
+        restore_id = self.store.save_restore_point("loc", "app", backups, ["app"])
         with (
             patch.object(
                 main, "update_services", AsyncMock(return_value={"app": "registry:5000/app:v2"})
             ),
             patch.object(main, "_auto_rollback", AsyncMock(return_value=False)) as restore,
         ):
-            await main.execute_local_rollback("chat", 1, "app", "v2", "header")
+            await main.execute_local_rollback("chat", 1, "app", "v2", "header", restore_id)
         restore.assert_awaited_once_with(
             self.stack.resolve(), self.stack.resolve() / "compose.yaml", backups, ["app"]
         )
         self.assertNotIn("Successfully rolled back", self.edit.await_args.args[3])
 
     async def test_manual_rollback_refuses_changed_configuration(self):
-        self.store.save_restore_point("loc", "app", {"vendor/app:v2": "vendor/app:backup"}, ["app"])
+        restore_id = self.store.save_restore_point("loc", "app", {"vendor/app:v2": "vendor/app:backup"}, ["app"])
         with (
             patch.object(main, "update_services", AsyncMock(side_effect=ValueError("changed tag"))),
             patch.object(main, "_auto_rollback", AsyncMock()) as restore,
         ):
-            await main.execute_local_rollback("chat", 1, "app", "v2", "header")
+            await main.execute_local_rollback("chat", 1, "app", "v2", "header", restore_id)
         restore.assert_not_awaited()
 
     async def test_mismatched_tag_and_failed_backup_do_not_pull(self):

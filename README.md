@@ -203,6 +203,8 @@ images:
 ```
 
 #### Update & rollback safety rules
+
+- **Rollback buttons:** Each button belongs to a specific restore point. Creating a newer restore point for the same stack or remote service invalidates older buttons. Buttons created before snapshot identifiers were introduced are also rejected.
 - **Tag-safe updates:** Only services matching the notification's repository and tag are updated. DiunTap never edits your `compose.yaml` or Quadlet files, and skips digest-pinned images. Unrelated services in the same Compose stack are not recreated.
 - **Rollback scope:** Rollback restores the previous container image ID (`up -d --pull never`), keeping the newest 3 backup tags per image. **Note:** image rollback does not revert application data or database schema migrations — always keep regular backups of your volumes.
 - **Remote Podman Quadlets:** When `REMOTE_SSH_HOST` is configured, DiunTap can update remote rootless Podman Quadlets over SSH (`ContainerName=` must match the unit basename, and `Pull=` should be default `missing` or `never`).
@@ -398,6 +400,8 @@ images:
 ```
 
 #### Bezpieczeństwo aktualizacji i rollbacku
+
+- **Przyciski rollbacku:** Każdy przycisk jest przypisany do konkretnego punktu przywracania. Utworzenie nowszej kopii dla tego samego stosu lub usługi zdalnej unieważnia starsze przyciski. Przyciski utworzone przed wprowadzeniem identyfikatorów kopii również są odrzucane.
 - **Aktualizacja wyłącznie zgodnych tagów:** DiunTap aktualizuje tylko usługi zgodne z repozytorium i tagiem z powiadomienia. Nie modyfikuje plików `compose.yaml` ani Quadletów i pomija obrazy przypięte do digestu (`@sha256:...`). Pozostałe usługi w tym samym pliku Compose nie są restartowane.
 - **Zakres rollbacku:** Rollback przywraca poprzedni identyfikator obrazu kontenera (`up -d --pull never`), przechowując do 3 ostatnich kopii tagów na obraz. **Pamiętaj:** cofnięcie obrazu nie cofa migracji bazy danych ani zmian w wolumenach danych — wykonuj regularne kopie zapasowe danych aplikacji.
 - **Zdalne Quadlety Podmana:** Po skonfigurowaniu `REMOTE_SSH_HOST` DiunTap potrafi aktualizować zdalne jednostki rootless Podman Quadlet po SSH (`ContainerName=` musi odpowiadać nazwie usługi, a polityka `Pull=` powinna mieć wartość domyślną `missing` lub `never`).

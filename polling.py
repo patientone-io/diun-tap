@@ -59,15 +59,15 @@ async def _run_serialized(key: Tuple[str, str], coro: Coroutine[Any, Any, None])
 
 async def _resolve_callback(
     cb_data: str,
-) -> Optional[Tuple[str, str, str, str, str, str]]:
-    """Return (kind, node, target, tag, header, image). Legacy has no stored image."""
+) -> Optional[Tuple[str, str, str, str, str, str, str]]:
+    """Return (kind, node, target, tag, header, image, restore_id). Legacy has no stored image."""
     if ":" in cb_data:
         prefix, _, rest = cb_data.partition(":")
         if prefix in ("upd", "rb", "ccl") and ":" not in rest:
             action = action_store.resolve(rest)
             if action is None:
                 return None
-            return (action.kind, action.node, action.target, action.tag, action.header, action.image)
+            return (action.kind, action.node, action.target, action.tag, action.header, action.image, action.restore_id)
     legacy = parse_legacy_callback(cb_data)
     if legacy is None:
         return None
@@ -83,7 +83,7 @@ async def _resolve_callback(
         tag = sanitize_tag(tag)
     except Exception:
         return None
-    return (kind, node, target, tag, "", "")
+    return (kind, node, target, tag, "", "", "")
 
 
 async def telegram_polling_loop(
@@ -150,7 +150,7 @@ async def telegram_polling_loop(
                     if resolved is None:
                         await answer_callback_query(bot_token, cb_id, text=t_fn("toast_dismissed"))
                         continue
-                    kind, node, target, tag, stored_header, image = resolved
+                    kind, node, target, tag, stored_header, image, restore_id = resolved
                     header_src = stored_header or (orig_text.split("\n\n")[0] if orig_text else "Container Update")
                     header = html.escape(header_src[:500])
 
@@ -185,7 +185,7 @@ async def telegram_polling_loop(
                             )
                             ok = await _run_serialized(
                                 ("rem", target),
-                                execute_remote_rollback(chat_id, msg_id, target, tag, header),
+                                execute_remote_rollback(chat_id, msg_id, target, tag, header, restore_id),
                             )
                             if not ok:
                                 await answer_callback_query(bot_token, cb_id, text=t_fn("toast_already_running"))
@@ -196,7 +196,7 @@ async def telegram_polling_loop(
                             )
                             ok = await _run_serialized(
                                 ("loc", target),
-                                execute_local_rollback(chat_id, msg_id, target, tag, header),
+                                execute_local_rollback(chat_id, msg_id, target, tag, header, restore_id),
                             )
                             if not ok:
                                 await answer_callback_query(bot_token, cb_id, text=t_fn("toast_already_running"))
